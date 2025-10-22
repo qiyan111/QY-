@@ -440,6 +440,12 @@ def load_alibaba_trace(trace_dir: str, max_inst: int = None) -> List['Task']:
     print(f"  CPU: {df['cpu'].mean():.3f} (std={df['cpu'].std():.3f})")
     print(f"  MEM: {df['mem'].mean():.3f} (std={df['mem'].std():.3f})\n")
 
+    # 可选：时间压缩以提高并发度（论文常用做法）
+    # TIME_SPEEDUP>1 表示将到达与持续时间按该倍数加速（压缩时间轴）
+    time_speedup = float(os.getenv("TIME_SPEEDUP", "1.0"))
+    if time_speedup <= 0:
+        time_speedup = 1.0
+
     tasks = []
     for idx, row in df.sort_values(5).iterrows():
         slo_sensitive = 'high' if int(row['task_type']) == 1 else 'low'
@@ -456,13 +462,18 @@ def load_alibaba_trace(trace_dir: str, max_inst: int = None) -> List['Task']:
         start = int(row['start_time'])
         end = int(row['end_time'])
         duration = max(end - start, 0) if end > start else 0
+        if time_speedup > 1.0:
+            # 压缩时间轴：加速到达与运行时长
+            start = int(start / time_speedup)
+            end = int(end / time_speedup) if end > 0 else start
+            duration = max(1, int(duration / time_speedup)) if duration > 0 else 0
 
         task = Task(
             id=inst_id,
             cpu=cpu_req,
             mem=mem_req,
             tenant=str(row[2]),
-            arrival=int(row[5]),
+            arrival=int(start),
             slo_sensitive=slo_sensitive,
             priority=int(row['task_priority']),
             # 新增字段
@@ -484,7 +495,11 @@ def load_alibaba_trace(trace_dir: str, max_inst: int = None) -> List['Task']:
           f"中位数={np.median(durations):.0f}秒, "
           f"P90={np.percentile(durations, 90):.0f}秒")
     print(f"  到达时间跨度: {min(arrivals):.0f} ~ {max(arrivals):.0f} (共{max(arrivals) - min(arrivals):.0f}秒)")
-    print(f"  推荐调度间隔: {min(int(np.median(durations)), 60)}秒 (中位时长的一半或60秒)\n")
+        # 在日志中反映时间压缩后的推荐步长
+        rec_step_log = min(int(np.median(durations)), 60)
+        if time_speedup > 1.0:
+            rec_step_log = max(1, int(rec_step_log / time_speedup))
+        print(f"  推荐调度间隔: {rec_step_log}秒 (中位时长的一半或60秒)\n")
 
     return tasks
 
@@ -522,6 +537,10 @@ def run_firmament(tasks: List[Task], num_machines: int = 114) -> dict:
     durations = [t.duration for t in tasks if t.duration > 0]
     median_duration = int(np.median(durations)) if durations else 60
     recommended_step = max(1, min(median_duration // 2, 60))  # 中位时长的一半，最多60秒
+    # 若启用时间压缩，按同倍数压缩调度步长，维持相对粒度
+    time_speedup = float(os.getenv("TIME_SPEEDUP", "1.0"))
+    if time_speedup > 1.0:
+        recommended_step = max(1, int(recommended_step / time_speedup))
     batch_step = int(os.getenv("BATCH_STEP_SECONDS", str(recommended_step)))
 
     print(f"  [事件驱动] 调度间隔={batch_step}秒 (任务中位时长={median_duration}秒)")
@@ -584,6 +603,9 @@ def run_mesos_drf(tasks: List[Task], num_machines: int = 114) -> dict:
     durations = [t.duration for t in tasks if t.duration > 0]
     median_duration = int(np.median(durations)) if durations else 60
     recommended_step = max(1, min(median_duration // 2, 60))
+    time_speedup = float(os.getenv("TIME_SPEEDUP", "1.0"))
+    if time_speedup > 1.0:
+        recommended_step = max(1, int(recommended_step / time_speedup))
     batch_step = int(os.getenv("BATCH_STEP_SECONDS", str(recommended_step)))
 
     print(f"  [事件驱动] 调度间隔={batch_step}秒 (任务中位时长={median_duration}秒)")
@@ -663,6 +685,9 @@ def run_tetris(tasks: List[Task], num_machines: int = 114) -> dict:
     durations = [t.duration for t in tasks if t.duration > 0]
     median_duration = int(np.median(durations)) if durations else 60
     recommended_step = max(1, min(median_duration // 2, 60))
+    time_speedup = float(os.getenv("TIME_SPEEDUP", "1.0"))
+    if time_speedup > 1.0:
+        recommended_step = max(1, int(recommended_step / time_speedup))
     batch_step = int(os.getenv("BATCH_STEP_SECONDS", str(recommended_step)))
 
     print(f"  [事件驱动] 调度间隔={batch_step}秒 (任务中位时长={median_duration}秒)")
