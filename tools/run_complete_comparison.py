@@ -1359,15 +1359,29 @@ def run_nextgen_scheduler(tasks: List[Task], num_machines: int = 114) -> dict:
     use_dynamic_release = os.getenv("NEXTGEN_DYNAMIC_RELEASE", "1") == "1"
     total_released = 0
 
-    # ⭐ 过程采样（与事件驱动模式保持一致）
+    # 事件驱动评估对齐：时间加权（AUC）+ 忙时窗口过滤 + 稳健CV
+    busy_util_min = float(os.getenv("BUSY_UTIL_MIN", "0.05"))
+    cv_min_mean_util = float(os.getenv("CV_MIN_MEAN_UTIL", "0.05"))
+
+    tw_total = 0.0
+    tw_util_sum = 0.0
+    tw_cpu_sum = 0.0
+    tw_mem_sum = 0.0
+    tw_real_cpu_sum = 0.0
+    tw_cv_sum = 0.0
+    max_util_seen = 0.0
+
+    # 仍保留稀疏采样以提供侧信息（非主统计口径）
     util_samples = []
     cpu_util_samples = []
     mem_util_samples = []
     real_cpu_samples = []
-    max_util_seen = 0.0
-    sample_interval = 100  # 每100个任务采样一次
+    sample_interval = 100  # 每100个任务采样一次（仅用于日志）
+
+    last_time = current_time
 
     while scheduled + failed < total_tasks:
+        prev_time = current_time
         # ⭐ 每次迭代开始时释放已完成任务的资源
         if use_dynamic_release:
             released_count = sum(m.release_completed_tasks(current_time) for m in machines)
@@ -1514,8 +1528,8 @@ def run_nextgen_scheduler(tasks: List[Task], num_machines: int = 114) -> dict:
                 attempts[tid] = attempt_count
                 retry_q.push(task_tuple, now_ms=current_time, attempts=attempt_count)
 
-        # Update global stats for next step
-        avg_util, max_util, std_util = cpu_mem_util(machines)
+        # Update global stats for next step（快照用于日志，不作为主统计口径）
+        avg_util, max_util_inst, std_util = cpu_mem_util(machines)
         frag = fragmentation(machines)
         imb = imbalance(machines)
         global_stats.update({
@@ -1523,6 +1537,44 @@ def run_nextgen_scheduler(tasks: List[Task], num_machines: int = 114) -> dict:
             "fragmentation": frag,
             "imbalance": imb,
         })
+
+        # ===== 时间加权积分（对齐 baselines 的事件驱动统计） =====
+        # 使用本轮结束时的占用状态作为 [prev_time, current_time) 的代表
+        delta_t = max(0, current_time - prev_time)
+        # 计算当前占用
+        current_utils = [m.utilization() for m in machines]
+        cpu_utils_now = [m.cpu_used / m.cpu if m.cpu > 0 else 0.0 for m in machines]
+        mem_utils_now = [m.mem_used / m.mem if m.mem > 0 else 0.0 for m in machines]
+        if current_utils:
+            avg_util_now = float(sum(current_utils) / len(current_utils))
+            cpu_util_now = float(sum(cpu_utils_now) / len(cpu_utils_now)) if cpu_utils_now else 0.0
+            mem_util_now = float(sum(mem_utils_now) / len(mem_utils_now)) if mem_utils_now else 0.0
+            # 稳健 CV（仅当平均≥阈值）
+            if avg_util_now >= cv_min_mean_util:
+                mean_u = avg_util_now
+                var_u = sum((u - mean_u) ** 2 for u in current_utils) / len(current_utils)
+                cv_now = (var_u ** 0.5) / mean_u if mean_u > 0 else 0.0
+            else:
+                cv_now = 0.0
+            # 真实CPU（仅动态释放模式下可得）
+            real_cpu_now = 0.0
+            if use_dynamic_release:
+                for m in machines:
+                    for tinfo in m.active_tasks:
+                        t_obj = next((t for t in sorted_tasks if t.id == tinfo['tid']), None)
+                        if t_obj:
+                            real_cpu_now += getattr(t_obj, 'real_cpu', tinfo['cpu'] * 0.5)
+
+            if delta_t > 0 and avg_util_now >= busy_util_min:
+                tw_total += delta_t
+                tw_util_sum += avg_util_now * delta_t
+                tw_cpu_sum += cpu_util_now * delta_t
+                tw_mem_sum += mem_util_now * delta_t
+                tw_real_cpu_sum += real_cpu_now * delta_t
+                tw_cv_sum += cv_now * delta_t
+
+            # 维护峰值
+            max_util_seen = max(max_util_seen, max(current_utils))
 
         # ⭐ 过程采样（每隔一定任务数采样一次）
         if (scheduled + failed) % sample_interval == 0:
@@ -1547,14 +1599,24 @@ def run_nextgen_scheduler(tasks: List[Task], num_machines: int = 114) -> dict:
                                 real_cpu_now += getattr(task_obj, 'real_cpu', task_info['cpu'] * 0.5)
                     real_cpu_samples.append(real_cpu_now)
 
-    # 计算过程平均指标（与事件驱动模式一致）
-    avg_util_over_time = sum(util_samples) / len(util_samples) if util_samples else 0.0
-    avg_cpu_util = sum(cpu_util_samples) / len(cpu_util_samples) if cpu_util_samples else 0.0
-    avg_mem_util = sum(mem_util_samples) / len(mem_util_samples) if mem_util_samples else 0.0
-
-    capacity_total = sum(m.cpu for m in machines)
-    avg_real_cpu = sum(real_cpu_samples) / len(real_cpu_samples) if real_cpu_samples else 0.0
-    effective_util_over_time = avg_real_cpu / capacity_total if capacity_total > 0 else 0.0
+    # 计算时间加权指标（与 baselines 对齐）；若无时间窗口则回退到算术平均
+    if tw_total > 0:
+        avg_util_over_time = tw_util_sum / tw_total
+        avg_cpu_util = tw_cpu_sum / tw_total
+        avg_mem_util = tw_mem_sum / tw_total
+        capacity_total = sum(m.cpu for m in machines)
+        avg_real_cpu = tw_real_cpu_sum / tw_total
+        effective_util_over_time = avg_real_cpu / capacity_total if capacity_total > 0 else 0.0
+        imbalance_over_time = tw_cv_sum / tw_total
+    else:
+        avg_util_over_time = sum(util_samples) / len(util_samples) if util_samples else 0.0
+        avg_cpu_util = sum(cpu_util_samples) / len(cpu_util_samples) if cpu_util_samples else 0.0
+        avg_mem_util = sum(mem_util_samples) / len(mem_util_samples) if mem_util_samples else 0.0
+        capacity_total = sum(m.cpu for m in machines)
+        avg_real_cpu = sum(real_cpu_samples) / len(real_cpu_samples) if real_cpu_samples else 0.0
+        effective_util_over_time = avg_real_cpu / capacity_total if capacity_total > 0 else 0.0
+        # 回退时无法稳健衡量CV，置0
+        imbalance_over_time = 0.0
 
     # 输出动态资源管理统计
     if use_dynamic_release:
@@ -1582,6 +1644,7 @@ def run_nextgen_scheduler(tasks: List[Task], num_machines: int = 114) -> dict:
         "avg_cpu_util": avg_cpu_util,
         "avg_mem_util": avg_mem_util,
         "effective_util_over_time": effective_util_over_time,
+        "imbalance_over_time": imbalance_over_time,
         "all_scheduled_task_ids": [t.id for t in sorted_tasks[:scheduled]],
     }
 
