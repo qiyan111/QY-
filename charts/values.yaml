@@ -1,0 +1,10 @@
+creditService:
+  image: credit-service:latest
+admissionController:
+  image: admission-controller:latest
+schedulerExtender:
+  image: scheduler-extender:latest
+sidecarAgent:
+  image: sidecar-agent:latest
+cgroupAdjuster:
+  image: cgroup-adjuster:latest

@@ -1,0 +1,4 @@
+apiVersion: v2
+name: slo-scheduler
+version: 0.1.0
+description: SLO-driven multi-tenant scheduler components

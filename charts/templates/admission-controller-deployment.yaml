@@ -1,0 +1,19 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: admission-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: admission-controller
+  template:
+    metadata:
+      labels:
+        app: admission-controller
+    spec:
+      containers:
+      - name: admission-controller
+        image: {{ .Values.admissionController.image }}
+        ports:
+        - containerPort: 8443
