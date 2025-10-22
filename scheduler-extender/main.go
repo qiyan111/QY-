@@ -11,7 +11,6 @@ import (
 
     corev1 "k8s.io/api/core/v1"
     "k8s.io/apimachinery/pkg/api/resource"
-    schedv1 "k8s.io/kubernetes/pkg/scheduler/api/v1"
 )
 
 const (
@@ -95,7 +94,7 @@ func reportMetrics(w http.ResponseWriter, r *http.Request) {
 
 func filter(w http.ResponseWriter, r *http.Request) {
     defer r.Body.Close()
-    var args schedv1.ExtenderArgs
+    var args ExtenderArgs
     if err := json.NewDecoder(r.Body).Decode(&args); err != nil {
         http.Error(w, err.Error(), http.StatusBadRequest)
         return
@@ -115,7 +114,7 @@ func filter(w http.ResponseWriter, r *http.Request) {
         }
     }
 
-    result := &schedv1.ExtenderFilterResult{
+    result := &ExtenderFilterResult{
         Nodes:       filtered,
         FailedNodes: failed,
     }
@@ -126,7 +125,7 @@ func filter(w http.ResponseWriter, r *http.Request) {
 
 func prioritize(w http.ResponseWriter, r *http.Request) {
     defer r.Body.Close()
-    var args schedv1.ExtenderArgs
+    var args ExtenderArgs
     if err := json.NewDecoder(r.Body).Decode(&args); err != nil {
         http.Error(w, err.Error(), http.StatusBadRequest)
         return
@@ -134,14 +133,14 @@ func prioritize(w http.ResponseWriter, r *http.Request) {
 
     snapshot := nodeMetricsStore.snapshot()
     pod := args.Pod
-    scores := make([]schedv1.HostPriority, len(args.Nodes.Items))
+    scores := make([]HostPriority, len(args.Nodes.Items))
 
     for i, node := range args.Nodes.Items {
         if metrics, ok := snapshot[node.Name]; ok && time.Since(metrics.Timestamp) <= metricsTTL {
-            scores[i] = schedv1.HostPriority{Host: node.Name, Score: calculateScore(&pod, metrics)}
+            scores[i] = HostPriority{Host: node.Name, Score: calculateScore(&pod, metrics)}
         } else {
             base := int64(math.Round(getPriorityBaseScore(&pod)))
-            scores[i] = schedv1.HostPriority{Host: node.Name, Score: clampScore(base)}
+            scores[i] = HostPriority{Host: node.Name, Score: clampScore(base)}
         }
     }
 

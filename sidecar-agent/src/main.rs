@@ -224,7 +224,7 @@ fn aggregate_samples(samples: &[ContainerMetricSample]) -> AggregatedMetrics {
         cpu_allocatable: cpu_alloc.max(num_cpus::get() as f64),
         cpu_used,
         memory_allocatable: mem_alloc.max(1.0),
-        memory_used,
+        memory_used: mem_used,
         tail_latency_p99,
         slo_violation_rate,
         dominant_share,

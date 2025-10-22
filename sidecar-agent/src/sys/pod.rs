@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -38,7 +38,7 @@ pub fn discover_pods(kubelet_root: &Path, cgroup_root: &Path) -> Result<Vec<PodC
             continue;
         }
 
-        if let Some(info) = build_pod_info(&path, cgroup_root).transpose()? {
+        if let Ok(Some(info)) = build_pod_info(&path, cgroup_root) {
             infos.push(info);
         }
     }
