@@ -196,12 +196,9 @@ def enable_event_driven_simulation(
                         'framework_id': task.tenant if hasattr(task, 'tenant') else '',
                     })
             
-            # 记录调度失败的任务
-            for task in pending_tasks:
-                if task.id not in scheduled_ids:
-                    failed_count += 1
-            
-            pending_tasks = []
+            # 未调度任务不判定为失败，保留到下一轮（与真实系统一致）
+            # 只有在模拟结束仍未被调度时，才可作为失败统计（本模拟暂不计算该项）
+            pending_tasks = [t for t in pending_tasks if t.id not in scheduled_ids]
         
         # ========== 步骤 3: 采样当前利用率（用于计算平均/峰值）==========
         # ⭐ 只在有运行中的任务时才采样（避免空闲时间稀释利用率）
