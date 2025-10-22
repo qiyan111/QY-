@@ -1657,11 +1657,20 @@ def analyze_result(result: dict, trace_dir: str, tasks: List[Task]) -> dict:
                     affinity_hits += 1
     affinity_rate = affinity_hits / affinity_total if affinity_total else 0.0
 
+    # 为调试输出计算 Σreal_cpu：
+    # - 事件驱动：使用时间加权真实利用率 × 总容量
+    # - 静态模式：使用上面静态分支计算的 real_used
+    capacity_total_dbg = sum(m.cpu for m in machines)
+    if 'effective_util_over_time' in result:
+        real_used_dbg = effective_util * capacity_total_dbg
+    else:
+        real_used_dbg = real_used
+
     print(f"[DEBUG] {result['name']:<30}")
     print(
         f"        任务: 已调度={len(req_cpu):5d} | CPU: Σreq={sum(req_cpu):7.1f} avg={mean_cpu:.3f} P50={p50_cpu:.2f}")
     print(
-        f"                                | MEM: Σreq={sum(req_mem):7.1f} avg={mean_mem:.3f} | Σreal_cpu={real_used:.1f}")
+        f"                                | MEM: Σreq={sum(req_mem):7.1f} avg={mean_mem:.3f} | Σreal_cpu={real_used_dbg:.1f}")
     print(f"        节点: CPU主导={cpu_dominant:2d}台, MEM主导={mem_dominant:2d}台 / 共{len(machines)}台")
 
     # ⭐ 事件驱动模式的输出
