@@ -1589,17 +1589,17 @@ def analyze_result(result: dict, trace_dir: str, tasks: List[Task]) -> dict:
         effective_util = real_used / capacity_total if capacity_total else 0.0
         waste_rate = 1.0 - effective_util
 
-    # ⭐ 使用事件驱动模拟过程中的利用率（而不是最终快照）
+    # ⭐ 使用事件驱动模拟过程中的时间加权指标（而不是最终快照）
     if 'avg_util_over_time' in result and 'max_util_seen' in result:
-        # 事件驱动模式：使用过程中采样的利用率
+        # 事件驱动模式：使用时间加权平均
         avg_util = result['avg_util_over_time']
         max_util = result['max_util_seen']
         cpu_util = result.get('avg_cpu_util', 0.0)
         mem_util = result.get('avg_mem_util', 0.0)
         # 碎片率基于平均利用率
         frag = 1.0 - avg_util
-        # 失配率设为0（事件驱动下最终快照不准确，无法计算有意义的 std）
-        imb = 0.0
+        # 使用时间加权的不均衡CV
+        imb = result.get('imbalance_over_time', 0.0)
         std_util = 0.0
     else:
         # 静态模式：使用最终快照

@@ -71,7 +71,8 @@ def enable_event_driven_simulation(
     # 当前模拟时间（⭐ 从第一个任务到达时间开始）
     current_time = min(t.arrival for t in tasks) if tasks else 0
     num_scheduling_rounds = 0
-    max_scheduling_rounds = 10000
+    # 允许通过环境变量调整最大轮次，避免大规模 trace 被过早截断
+    max_scheduling_rounds = int(os.getenv("MAX_SCHED_ROUNDS", "1000000"))
     
     print(f"  [模拟] 开始时间: {current_time}, 最大轮次: {max_scheduling_rounds}")
     
@@ -79,11 +80,19 @@ def enable_event_driven_simulation(
     pending_tasks = []
     
     # ⭐ 追踪过程中的利用率（解决"最终快照"问题）
-    util_samples = []  # 每个调度轮次的利用率快照
+    util_samples = []  # 每个调度轮次的利用率快照（调试用）
     cpu_util_samples = []  # CPU 利用率快照
     mem_util_samples = []  # MEM 利用率快照
     real_cpu_samples = []  # 真实 CPU 使用量快照
+    cv_samples = []       # 节点利用率变异系数快照（不均衡度）
     max_util_seen = 0.0
+    # 时间加权积分（AUC）
+    tw_util_sum = 0.0
+    tw_cpu_sum = 0.0
+    tw_mem_sum = 0.0
+    tw_real_cpu_sum = 0.0
+    tw_cv_sum = 0.0
+    tw_total = 0.0
     
     # ========== 主模拟循环（对应 Firmament 的 ReplaySimulation while 循环）==========
     debug_round = 0
@@ -201,49 +210,69 @@ def enable_event_driven_simulation(
             pending_tasks = [t for t in pending_tasks if t.id not in scheduled_ids]
         
         # ========== 步骤 3: 采样当前利用率（用于计算平均/峰值）==========
-        # ⭐ 只在有运行中的任务时才采样（避免空闲时间稀释利用率）
-        if running_tasks or len([m for m in machines if m.cpu_used > 0 or m.mem_used > 0]) > 0:
-            current_utils = [max(m.cpu_used/m.cpu if m.cpu > 0 else 0, 
-                                m.mem_used/m.mem if m.mem > 0 else 0) for m in machines]
+        have_load = running_tasks or any((m.cpu_used > 0 or m.mem_used > 0) for m in machines)
+        avg_util_now = cpu_util_now = mem_util_now = real_cpu_now = cv_now = 0.0
+        if have_load:
+            current_utils = [max(m.cpu_used/m.cpu if m.cpu > 0 else 0,
+                                 m.mem_used/m.mem if m.mem > 0 else 0) for m in machines]
             cpu_utils = [m.cpu_used/m.cpu if m.cpu > 0 else 0 for m in machines]
             mem_utils = [m.mem_used/m.mem if m.mem > 0 else 0 for m in machines]
-            
+
             # ⭐ 计算当前时刻运行中任务的真实CPU使用量
             real_cpu_now = 0.0
-            for tid, (mid, end_time, res) in running_tasks.items():
+            for tid, (_mid, _end_time, res) in running_tasks.items():
                 task = task_dict.get(tid)
                 if task:
                     real_cpu_now += getattr(task, 'real_cpu', res['cpu'] * 0.5)
-            
+
             if current_utils:
                 avg_util_now = sum(current_utils) / len(current_utils)
                 max_util_now = max(current_utils)
-                cpu_util_now = sum(cpu_utils) / len(cpu_utils) if cpu_utils else 0
-                mem_util_now = sum(mem_utils) / len(mem_utils) if mem_utils else 0
-                
+                cpu_util_now = sum(cpu_utils) / len(cpu_utils) if cpu_utils else 0.0
+                mem_util_now = sum(mem_utils) / len(mem_utils) if mem_utils else 0.0
+                # 变异系数（不均衡度）
+                mean_u = avg_util_now
+                if mean_u > 1e-12:
+                    var = sum((u - mean_u) ** 2 for u in current_utils) / len(current_utils)
+                    std_u = var ** 0.5
+                    cv_now = std_u / mean_u
+                else:
+                    cv_now = 0.0
+
                 util_samples.append(avg_util_now)
                 cpu_util_samples.append(cpu_util_now)
                 mem_util_samples.append(mem_util_now)
                 real_cpu_samples.append(real_cpu_now)  # ⭐ 采样真实CPU使用量
+                cv_samples.append(cv_now)
                 max_util_seen = max(max_util_seen, max_util_now)
-        
-        # ========== 步骤 4: 推进到下一个事件时间 ==========
-        # ⭐ 改进：直接跳转到下一个事件时间（避免空转）
+
+        # ========== 步骤 4: 推进到下一个事件时间（并做时间加权积分） ==========
+        # ⭐ 改进：直接跳转到下一个事件时间（避免空转），并以区间长度做加权
         if events:
             next_event_time = events[0][0]
             if running_tasks:
-                # 有任务在运行：按固定间隔推进（等待任务完成）
-                current_time = min(current_time + batch_step_seconds, next_event_time)
+                next_time = min(current_time + batch_step_seconds, next_event_time)
             else:
-                # 没有任务运行：直接跳到下一个事件（避免空转）
-                current_time = next_event_time
+                next_time = next_event_time
         else:
-            # 没有更多事件：按固定间隔推进（等待运行中任务完成）
             if running_tasks:
-                current_time += batch_step_seconds
+                next_time = current_time + batch_step_seconds
             else:
                 # 没有事件也没有运行中任务，结束模拟
                 break
+
+        # 时间加权积分（使用本轮采样的状态覆盖 [current_time, next_time)）
+        if have_load:
+            delta_t = max(0, next_time - current_time)
+            if delta_t > 0:
+                tw_total += delta_t
+                tw_util_sum += avg_util_now * delta_t
+                tw_cpu_sum += cpu_util_now * delta_t
+                tw_mem_sum += mem_util_now * delta_t
+                tw_real_cpu_sum += real_cpu_now * delta_t
+                tw_cv_sum += cv_now * delta_t
+
+        current_time = next_time
         
         num_scheduling_rounds += 1
         
@@ -252,24 +281,33 @@ def enable_event_driven_simulation(
             break
     
     # 最终统计
-    # ⭐ 计算过程中的平均利用率（而不是最终快照）
-    avg_util_over_time = sum(util_samples) / len(util_samples) if util_samples else 0.0
-    avg_cpu_util = sum(cpu_util_samples) / len(cpu_util_samples) if cpu_util_samples else 0.0
-    avg_mem_util = sum(mem_util_samples) / len(mem_util_samples) if mem_util_samples else 0.0
-    
-    # ⭐ 计算时间加权的真实CPU利用率（而不是累计总和）
-    capacity_total = sum(m.cpu for m in machines)
-    avg_real_cpu = sum(real_cpu_samples) / len(real_cpu_samples) if real_cpu_samples else 0.0
-    effective_util_over_time = avg_real_cpu / capacity_total if capacity_total > 0 else 0.0
+    # ⭐ 计算时间加权均值（若无时间窗口，则退化为算术平均）
+    if tw_total > 0:
+        avg_util_over_time = tw_util_sum / tw_total
+        avg_cpu_util = tw_cpu_sum / tw_total
+        avg_mem_util = tw_mem_sum / tw_total
+        capacity_total = sum(m.cpu for m in machines)
+        avg_real_cpu = tw_real_cpu_sum / tw_total
+        effective_util_over_time = avg_real_cpu / capacity_total if capacity_total > 0 else 0.0
+        imbalance_over_time = tw_cv_sum / tw_total
+    else:
+        avg_util_over_time = sum(util_samples) / len(util_samples) if util_samples else 0.0
+        avg_cpu_util = sum(cpu_util_samples) / len(cpu_util_samples) if cpu_util_samples else 0.0
+        avg_mem_util = sum(mem_util_samples) / len(mem_util_samples) if mem_util_samples else 0.0
+        capacity_total = sum(m.cpu for m in machines)
+        avg_real_cpu = sum(real_cpu_samples) / len(real_cpu_samples) if real_cpu_samples else 0.0
+        effective_util_over_time = avg_real_cpu / capacity_total if capacity_total > 0 else 0.0
+        imbalance_over_time = sum(cv_samples) / len(cv_samples) if cv_samples else 0.0
     
     # ⭐ 调试输出
     print(f"\n  [事件驱动统计]")
     print(f"    调度轮次: {num_scheduling_rounds}")
     print(f"    已调度: {scheduled_count}, 失败: {failed_count}")
     print(f"    采样次数: {len(util_samples)} (有任务运行时才采样)")
-    print(f"    过程平均利用率(请求): {avg_util_over_time*100:.1f}%")
-    print(f"    过程平均CPU利用率(请求): {avg_cpu_util*100:.1f}%")
-    print(f"    过程平均真实利用率: {effective_util_over_time*100:.1f}%")
+    print(f"    过程平均利用率(时间加权): {avg_util_over_time*100:.1f}%")
+    print(f"    过程平均CPU利用率(时间加权): {avg_cpu_util*100:.1f}%")
+    print(f"    过程平均真实利用率(时间加权): {effective_util_over_time*100:.1f}%")
+    print(f"    过程不均衡CV(时间加权): {imbalance_over_time*100:.1f}%")
     print(f"    峰值利用率: {max_util_seen*100:.1f}%")
     print(f"    已释放任务: {scheduled_count - len(running_tasks)}")
     print(f"    仍在运行: {len(running_tasks)}")
@@ -289,6 +327,7 @@ def enable_event_driven_simulation(
         "avg_cpu_util": avg_cpu_util,              # ⭐ 过程中的平均 CPU 利用率（请求量）
         "avg_mem_util": avg_mem_util,              # ⭐ 过程中的平均 MEM 利用率（请求量）
         "effective_util_over_time": effective_util_over_time,  # ⭐ 过程中的平均真实CPU利用率
+        "imbalance_over_time": imbalance_over_time,            # ⭐ 过程中的平均不均衡CV
         "total_released": scheduled_count - len(running_tasks),  # 已释放任务数（修正计算）
         "all_scheduled_task_ids": all_scheduled_tasks,  # ⭐ 所有已调度任务ID
     }
