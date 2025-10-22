@@ -96,6 +96,10 @@ def enable_event_driven_simulation(
     tw_cv_sum = 0.0
     tw_total = 0.0
     
+    # 负载与波动门限（模仿论文常用“稳态窗口/忙时窗口”处理）
+    busy_util_min = float(os.getenv("BUSY_UTIL_MIN", "0.05"))      # 仅当 AvgUtil≥此值才计入时间加权
+    cv_min_mean_util = float(os.getenv("CV_MIN_MEAN_UTIL", "0.05"))  # 仅当 AvgUtil≥此值才计算CV
+
     # ========== 主模拟循环（对应 Firmament 的 ReplaySimulation while 循环）==========
     debug_round = 0
     while events or running_tasks or pending_tasks:
@@ -239,9 +243,9 @@ def enable_event_driven_simulation(
                 max_util_now = max(current_utils)
                 cpu_util_now = sum(cpu_utils) / len(cpu_utils) if cpu_utils else 0.0
                 mem_util_now = sum(mem_utils) / len(mem_utils) if mem_utils else 0.0
-                # 变异系数（不均衡度）
+                # 变异系数（不均衡度）- 仅在平均≥阈值时计算，避免接近0时爆炸
                 mean_u = avg_util_now
-                if mean_u > 1e-12:
+                if mean_u >= cv_min_mean_util:
                     var = sum((u - mean_u) ** 2 for u in current_utils) / len(current_utils)
                     std_u = var ** 0.5
                     cv_now = std_u / mean_u
@@ -260,7 +264,8 @@ def enable_event_driven_simulation(
         next_time = next_schedule_at + batch_step_seconds
 
         # 时间加权积分（使用本轮采样的状态覆盖 [current_time, next_time)）
-        if have_load:
+        # 仅当 AvgUtil 达到“忙时”阈值时计入时间加权，模仿论文去除冷启动/冷却期
+        if have_load and avg_util_now >= busy_util_min:
             delta_t = max(0, (next_time - next_schedule_at))
             if delta_t > 0:
                 tw_total += delta_t
