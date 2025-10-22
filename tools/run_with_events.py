@@ -177,6 +177,8 @@ def enable_event_driven_simulation(
             
             # 处理调度结果
             scheduled_ids = set()
+            # 使用当前调度节拍时间作为放置时间
+            schedule_time = next_schedule_at
             for task_id, machine_id in placements:
                 task = task_dict.get(task_id)
                 if not task:
@@ -200,7 +202,7 @@ def enable_event_driven_simulation(
                 
                 # ⭐ 添加任务结束事件（对应 OnTaskPlacement -> UpdateTaskEndEvents）
                 if hasattr(task, 'duration') and task.duration > 0:
-                    end_time = current_time + task.duration
+                    end_time = schedule_time + task.duration
                     heapq.heappush(events, (end_time, event_counter, 'TASK_END_RUNTIME', task_id))
                     event_counter += 1
                     

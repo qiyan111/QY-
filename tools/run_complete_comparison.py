@@ -495,11 +495,11 @@ def load_alibaba_trace(trace_dir: str, max_inst: int = None) -> List['Task']:
           f"中位数={np.median(durations):.0f}秒, "
           f"P90={np.percentile(durations, 90):.0f}秒")
     print(f"  到达时间跨度: {min(arrivals):.0f} ~ {max(arrivals):.0f} (共{max(arrivals) - min(arrivals):.0f}秒)")
-        # 在日志中反映时间压缩后的推荐步长
-        rec_step_log = min(int(np.median(durations)), 60)
-        if time_speedup > 1.0:
-            rec_step_log = max(1, int(rec_step_log / time_speedup))
-        print(f"  推荐调度间隔: {rec_step_log}秒 (中位时长的一半或60秒)\n")
+    # 在日志中反映时间压缩后的推荐步长
+    rec_step_log = min(int(np.median(durations)), 60)
+    if time_speedup > 1.0:
+        rec_step_log = max(1, int(rec_step_log / time_speedup))
+    print(f"  推荐调度间隔: {rec_step_log}秒 (中位时长的一半或60秒)\n")
 
     return tasks
 
