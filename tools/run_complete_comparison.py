@@ -39,6 +39,13 @@ from tools.scheduler_nextgen import (
     EWMA,
 )
 from tools.run_with_events import enable_event_driven_simulation
+from tools.jct_slo import (
+    build_job_index,
+    compute_job_times,
+    summarize_jct,
+    build_job_types,
+    compute_slo_violations,
+)
 
 # 全局随机种子（影响数据加载等通用操作）
 np.random.seed(42)
@@ -554,6 +561,20 @@ def run_firmament(tasks: List[Task], num_machines: int = 114) -> dict:
     )
 
     result["name"] = "Firmament (OSDI'16 源码)"
+    # 计算 JCT 与 SLO（作业级）
+    try:
+        job_map, _ = build_job_index(tasks)
+        job_times = compute_job_times(result.get('timelines', {}), job_map, tasks)
+        result['jct_summary'] = summarize_jct(job_times)
+        job_types = build_job_types(tasks)
+        slo_thresholds = {
+            'high': float(os.getenv('SLO_JCT_HIGH', '600')),  # 10 分钟
+            'low': float(os.getenv('SLO_JCT_LOW', '900')),    # 15 分钟
+            'default': float(os.getenv('SLO_JCT_DEFAULT', '900')),
+        }
+        result['slo_violations'] = compute_slo_violations(job_times, job_types, slo_thresholds)
+    except Exception as _:
+        pass
     return result
 
 
@@ -619,6 +640,20 @@ def run_mesos_drf(tasks: List[Task], num_machines: int = 114) -> dict:
     )
 
     result["name"] = "Mesos DRF (NSDI'11 源码)"
+    # 计算 JCT 与 SLO（作业级）
+    try:
+        job_map, _ = build_job_index(tasks)
+        job_times = compute_job_times(result.get('timelines', {}), job_map, tasks)
+        result['jct_summary'] = summarize_jct(job_times)
+        job_types = build_job_types(tasks)
+        slo_thresholds = {
+            'high': float(os.getenv('SLO_JCT_HIGH', '600')),  # 10 分钟
+            'low': float(os.getenv('SLO_JCT_LOW', '900')),    # 15 分钟
+            'default': float(os.getenv('SLO_JCT_DEFAULT', '900')),
+        }
+        result['slo_violations'] = compute_slo_violations(job_times, job_types, slo_thresholds)
+    except Exception as _:
+        pass
     return result
 
 
@@ -700,6 +735,20 @@ def run_tetris(tasks: List[Task], num_machines: int = 114) -> dict:
     )
 
     result["name"] = "Tetris (SIGCOMM'14 公式)"
+    # 计算 JCT 与 SLO（作业级）
+    try:
+        job_map, _ = build_job_index(tasks)
+        job_times = compute_job_times(result.get('timelines', {}), job_map, tasks)
+        result['jct_summary'] = summarize_jct(job_times)
+        job_types = build_job_types(tasks)
+        slo_thresholds = {
+            'high': float(os.getenv('SLO_JCT_HIGH', '600')),  # 10 分钟
+            'low': float(os.getenv('SLO_JCT_LOW', '900')),    # 15 分钟
+            'default': float(os.getenv('SLO_JCT_DEFAULT', '900')),
+        }
+        result['slo_violations'] = compute_slo_violations(job_times, job_types, slo_thresholds)
+    except Exception as _:
+        pass
     return result
 
 
@@ -1875,6 +1924,21 @@ def main():
     res_nextgen = run_nextgen_scheduler(tasks, num_machines)
     print(
         f"  [DEBUG] NextGen返回: scheduled={res_nextgen.get('scheduled', 'N/A')}, failed={res_nextgen.get('failed', 'N/A')}")
+    # 计算 JCT 与 SLO（作业级）
+    try:
+        job_map, _ = build_job_index(tasks)
+        job_times = compute_job_times(res_nextgen.get('timelines', {}), job_map, tasks)
+        res_nextgen['jct_summary'] = summarize_jct(job_times)
+        job_types = build_job_types(tasks)
+        slo_thresholds = {
+            'high': float(os.getenv('SLO_JCT_HIGH', '600')),
+            'low': float(os.getenv('SLO_JCT_LOW', '900')),
+            'default': float(os.getenv('SLO_JCT_DEFAULT', '900')),
+        }
+        res_nextgen['slo_violations'] = compute_slo_violations(job_times, job_types, slo_thresholds)
+    except Exception as _:
+        pass
+
     results.append(analyze_result(res_nextgen, sys.argv[1], tasks))
 
     # 输出对比（修正对齐）

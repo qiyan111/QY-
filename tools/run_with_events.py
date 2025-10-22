@@ -63,6 +63,8 @@ def enable_event_driven_simulation(
     
     # ⭐ 追踪所有已调度任务（用于计算 effective_util）
     all_scheduled_tasks = []  # 存储所有已调度任务的 ID
+    # ⭐ 任务时间线（用于 JCT/SLO 计算）：tid -> {submit,start,end}
+    timelines: Dict[str, Dict[str, int]] = {}
     
     # 统计
     scheduled_count = 0
@@ -150,10 +152,22 @@ def enable_event_driven_simulation(
                         framework_id = resources.get('tenant', resources.get('framework_id', ''))
                         allocator_obj.recover_resources(framework_id, machine_id, 
                                                        resources['cpu'], resources['mem'])
+                    # 记录结束时间
+                    try:
+                        timelines.setdefault(str(task_id), {})['end'] = timestamp
+                    except Exception:
+                        pass
             
             elif event_type == 'TASK_SUBMIT':
                 # 任务到达，加入待调度队列（累积到下一次调度）
                 pending_tasks.append(data)
+                # 记录提交时间
+                try:
+                    tid_ = str(getattr(data, 'id', ''))
+                    if tid_:
+                        timelines.setdefault(tid_, {}).setdefault('submit', timestamp)
+                except Exception:
+                    pass
         
         # ⭐ 调试：如果处理了很多事件但没有待调度任务，说明有问题
         if os.getenv("DEBUG_EVENT_LOOP", "0") == "1" and events_processed > 0 and num_scheduling_rounds < 10:
@@ -204,6 +218,11 @@ def enable_event_driven_simulation(
                 scheduled_count += 1
                 all_scheduled_tasks.append(task_id)  # ⭐ 记录所有已调度任务
                 
+                # 记录开始时间
+                try:
+                    timelines.setdefault(str(task_id), {}).setdefault('start', schedule_time)
+                except Exception:
+                    pass
                 # ⭐ 添加任务结束事件（对应 OnTaskPlacement -> UpdateTaskEndEvents）
                 if hasattr(task, 'duration') and task.duration > 0:
                     end_time = schedule_time + task.duration
