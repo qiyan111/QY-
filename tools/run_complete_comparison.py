@@ -25,11 +25,9 @@ import random
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
-# 添加 scheduler_frameworks 到路径
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'scheduler_frameworks'))
 
-from firmament_scheduler import FirmamentScheduler, Machine as FirmMachine, Task as FirmTask
-from mesos_drf_allocator import HierarchicalAllocator, Agent, Client, Task as MesosTask
+from scheduler_frameworks.firmament_scheduler import FirmamentScheduler, Machine as FirmMachine, Task as FirmTask
+from scheduler_frameworks.mesos_drf_allocator import HierarchicalAllocator, Agent, Client, Task as MesosTask
 from collections import defaultdict
 
 from tools.metrics import cpu_mem_util, fragmentation, imbalance, net_bandwidth
