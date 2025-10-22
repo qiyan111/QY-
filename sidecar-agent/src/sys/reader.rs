@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::task;
@@ -36,8 +35,12 @@ impl MetricsCollector {
     pub async fn collect(&self) -> Result<Vec<ContainerMetricSample>> {
         let kubelet = self.kubelet_root.clone();
         let cgroup_root = self.cgroup_root.clone();
+        let collector = Self {
+            kubelet_root: kubelet.clone(),
+            cgroup_root: cgroup_root.clone(),
+        };
 
-        task::spawn_blocking(move || self.collect_sync(&kubelet, &cgroup_root))
+        task::spawn_blocking(move || collector.collect_sync(&kubelet, &cgroup_root))
             .await
             .context("collect metrics task")?
     }

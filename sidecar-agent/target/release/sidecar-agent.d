@@ -1,0 +1,1 @@
+/workspace/sidecar-agent/target/release/sidecar-agent: /workspace/sidecar-agent/src/main.rs /workspace/sidecar-agent/src/sys/mod.rs /workspace/sidecar-agent/src/sys/pod.rs /workspace/sidecar-agent/src/sys/reader.rs

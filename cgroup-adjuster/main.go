@@ -5,7 +5,7 @@ import (
     "log"
     "time"
 
-    cg "github.com/containerd/cgroups/v3"
+    _ "github.com/containerd/cgroups/v3"
     slopb "github.com/example/slo-scheduler/proto/api/slo"
     "google.golang.org/grpc"
 )
@@ -40,7 +40,6 @@ func adjustOnce() {
     if resp.Score < 0.5 {
         quota = 50000 // limit CPU if low credit
     }
-    // TODO: find cgroup path of demo tenant pod/container
-    _ = cg // silence unused import until logic implemented
+    // TODO: find cgroup path of demo tenant pod/container and apply quota
     log.Printf("would set quota=%d for tenant demo (score %.2f)", quota, resp.Score)
 }
