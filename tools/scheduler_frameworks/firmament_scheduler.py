@@ -12,9 +12,9 @@ Firmament Flow Scheduler 完整实现
 
 from typing import List, Tuple, Dict
 from dataclasses import dataclass
-from flow_graph import FlowGraph, FlowGraphNode, NodeType, FlowGraphArc
-from octopus_cost_model import OctopusCostModel
-from min_cost_flow_solver import MinCostFlowSolver
+from .flow_graph import FlowGraph, FlowGraphNode, NodeType, FlowGraphArc
+from .octopus_cost_model import OctopusCostModel
+from .min_cost_flow_solver import MinCostFlowSolver
 
 @dataclass
 class Task:
@@ -126,11 +126,11 @@ class FirmamentScheduler:
         cost, cap_lower, cap_upper = self.cost_model.task_to_unscheduled_agg(task.id)
         self.graph.add_arc(task_node, unscheduled_node, cost, cap_lower, cap_upper)
         
-        # Unscheduled Agg → Sink
-        self.graph.add_arc(unscheduled_node, self.sink, 0, 1, 0)
+        # Unscheduled Agg → Sink (单位容量，允许1单位流)
+        self.graph.add_arc(unscheduled_node, self.sink, 0, 0, 1)
         
-        # Task → Cluster Agg (EC)
-        self.graph.add_arc(task_node, self.cluster_agg, 0, 1, 0)
+        # Task → Cluster Agg (EC) (单位容量)
+        self.graph.add_arc(task_node, self.cluster_agg, 0, 0, 1)
         
         return task_node
     

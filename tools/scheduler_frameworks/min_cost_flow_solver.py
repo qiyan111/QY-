@@ -11,7 +11,7 @@ Firmament 调用流程:
 
 from ortools.graph.python import min_cost_flow
 from typing import List, Tuple, Dict
-from flow_graph import FlowGraph, FlowGraphArc, NodeType
+from .flow_graph import FlowGraph, FlowGraphArc, NodeType
 
 class MinCostFlowSolver:
     """
