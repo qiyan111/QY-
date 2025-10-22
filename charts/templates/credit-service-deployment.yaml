@@ -1,0 +1,19 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: credit-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: credit-service
+  template:
+    metadata:
+      labels:
+        app: credit-service
+    spec:
+      containers:
+      - name: credit-service
+        image: {{ .Values.creditService.image }}
+        ports:
+        - containerPort: 8081

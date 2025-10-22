@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package api.slo;
+
+option go_package = "github.com/example/slo-scheduler/proto/api/slo;slosv1";
+
+import "slo.proto";
+import "google/protobuf/empty.proto";
+
+service TenantCreditService {
+  rpc GetTenantCredit(TenantCreditRequest) returns (TenantCredit) {}
+  rpc RecordViolation(ViolationRecord) returns (google.protobuf.Empty) {}
+  rpc UpdateTenantSLO(TenantSLO) returns (google.protobuf.Empty) {}
+}
+
+message TenantCreditRequest {
+  string tenant_id = 1;
+}

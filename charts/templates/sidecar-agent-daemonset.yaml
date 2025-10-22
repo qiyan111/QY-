@@ -1,0 +1,19 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: sidecar-agent
+spec:
+  selector:
+    matchLabels:
+      app: sidecar-agent
+  template:
+    metadata:
+      labels:
+        app: sidecar-agent
+    spec:
+      hostPID: true
+      containers:
+      - name: sidecar-agent
+        image: {{ .Values.sidecarAgent.image }}
+        securityContext:
+          privileged: true

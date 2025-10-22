@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package api.slo;
+
+option go_package = "github.com/example/slo-scheduler/proto/api/slo;slosv1";
+
+// MetricType enumerates the supported service level indicators.
+enum MetricType {
+  METRIC_TYPE_UNSPECIFIED = 0;
+  LATENCY = 1;      // e.g. p99 latency in milliseconds
+  THROUGHPUT = 2;   // e.g. requests per second
+  ERROR_RATE = 3;   // e.g. 5xx percentage
+}
+
+// SLOTarget describes a single Service Level Objective target.
+message SLOTarget {
+  MetricType metric = 1;
+  // For latency objectives, specify the percentile (e.g., 0.99 for p99).
+  double percentile = 2;
+  // Threshold value — interpretation depends on metric type.
+  // For latency: milliseconds; throughput: requests per second; error_rate: fraction 0-1.
+  double threshold = 3;
+  // Observation window in seconds (e.g., 86400 for 1-day rolling window).
+  int32 window_seconds = 4;
+}
+
+// TenantSLO groups all SLO targets declared by one tenant (website/app).
+message TenantSLO {
+  string tenant_id = 1;
+  repeated SLOTarget targets = 2;
+  // Optional weight for each target (defaults handled server-side).
+  repeated double weights = 3;
+}
+
+// ViolationRecord logs an SLO breach event.
+message ViolationRecord {
+  string tenant_id = 1;
+  string slo_id = 2;      // hashed index of the target
+  int64  timestamp = 3;   // unix epoch millis
+  double observed_value = 4;
+}
+
+// TenantCredit represents the real-time credit (higher is better) for a tenant.
+message TenantCredit {
+  string tenant_id = 1;
+  double score = 2;
+  // Rolling error budget remaining (0-1).
+  double budget_remaining = 3;
+  // Last updated unix epoch millis.
+  int64  update_ts = 4;
+}
