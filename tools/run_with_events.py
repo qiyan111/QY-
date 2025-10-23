@@ -65,6 +65,8 @@ def enable_event_driven_simulation(
     all_scheduled_tasks = []  # 存储所有已调度任务的 ID
     # ⭐ 任务时间线（用于 JCT/SLO 计算）：tid -> {submit,start,end}
     timelines: Dict[str, Dict[str, int]] = {}
+    # ⭐ 任务时间线（用于 JCT/SLO 计算）：tid -> {submit,start,end}
+    timelines: Dict[str, Dict[str, int]] = {}
     
     # 统计
     scheduled_count = 0
@@ -101,6 +103,9 @@ def enable_event_driven_simulation(
     # 负载与波动门限（模仿论文常用“稳态窗口/忙时窗口”处理）
     busy_util_min = float(os.getenv("BUSY_UTIL_MIN", "0.05"))      # 仅当 AvgUtil≥此值才计入时间加权
     cv_min_mean_util = float(os.getenv("CV_MIN_MEAN_UTIL", "0.05"))  # 仅当 AvgUtil≥此值才计算CV
+    # 采样/调度子采样：每 N 个节拍才执行一次完整调度（近似法，加速）
+    subsample = int(os.getenv("SCHEDULE_SUBSAMPLE", "1"))
+    subsample = max(1, subsample)
 
     # ========== 主模拟循环（对应 Firmament 的 ReplaySimulation while 循环）==========
     debug_round = 0
@@ -173,9 +178,9 @@ def enable_event_driven_simulation(
         if os.getenv("DEBUG_EVENT_LOOP", "0") == "1" and events_processed > 0 and num_scheduling_rounds < 10:
             print(f"  [步骤1] 处理了 {events_processed} 个事件, pending_tasks={len(pending_tasks)}")
         
-        # ========== 步骤 2: 运行调度器（仅在调度节拍触发时运行） ==========
+        # ========== 步骤 2: 运行调度器（仅在调度节拍触发时运行，支持子采样） ==========
         # 对应 ScheduleJobsHelper
-        if pending_tasks:
+        if pending_tasks and (num_scheduling_rounds % subsample == 0):
             # ⭐ 调试：第一轮调度
             if os.getenv("DEBUG_EVENT_LOOP", "0") == "1" and num_scheduling_rounds < 3:
                 print(f"  [步骤2] 调度轮次 {num_scheduling_rounds}: 尝试调度 {len(pending_tasks)} 个任务")
@@ -280,7 +285,7 @@ def enable_event_driven_simulation(
 
         # ========== 步骤 4: 推进到下一个调度节拍（并做时间加权积分） ==========
         # 以区间长度做时间加权： [current_time, next_schedule_at)
-        next_time = next_schedule_at + batch_step_seconds
+        next_time = next_schedule_at + batch_step_seconds * subsample
 
         # 时间加权积分（使用本轮采样的状态覆盖 [current_time, next_time)）
         # 仅当 AvgUtil 达到“忙时”阈值时计入时间加权，模仿论文去除冷启动/冷却期
