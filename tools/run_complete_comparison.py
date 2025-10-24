@@ -627,10 +627,14 @@ def run_tetris(tasks: List[Task], num_machines: int = 114) -> dict:
         Tetris 贪心调度逻辑
         SIGCOMM'14 Section 3.2, Equation 1
         
-        ⚠️ 重要：需要在批次内临时更新 cpu_used/mem_used，
-        防止多个任务过度分配到同一台机器
+        ⚠️ 重要：使用临时状态跟踪批次内的资源分配，
+        但不修改真实的machines对象（避免与框架的更新冲突）
         """
         placements = []
+        
+        # ✅ 创建临时状态字典，跟踪批次内的资源分配
+        temp_cpu_used = {m.id: m.cpu_used for m in current_machines}
+        temp_mem_used = {m.id: m.mem_used for m in current_machines}
 
         # 拆分任务队列，高敏感任务优先调度
         high_queue = [t for t in batch_tasks if t.slo_sensitive == 'high']
@@ -651,14 +655,15 @@ def run_tetris(tasks: List[Task], num_machines: int = 114) -> dict:
             best_score = float('-inf')
 
             for machine in current_machines:
-                if (machine.cpu_used + task.cpu > machine.cpu or
-                        machine.mem_used + task.mem > machine.mem):
+                # ✅ 使用临时状态检查资源
+                if (temp_cpu_used[machine.id] + task.cpu > machine.cpu or
+                        temp_mem_used[machine.id] + task.mem > machine.mem):
                     continue
 
-                cpu_norm_before = machine.cpu_used / machine.cpu
-                mem_norm_before = machine.mem_used / machine.mem
-                cpu_norm_after = (machine.cpu_used + task.cpu) / machine.cpu
-                mem_norm_after = (machine.mem_used + task.mem) / machine.mem
+                cpu_norm_before = temp_cpu_used[machine.id] / machine.cpu
+                mem_norm_before = temp_mem_used[machine.id] / machine.mem
+                cpu_norm_after = (temp_cpu_used[machine.id] + task.cpu) / machine.cpu
+                mem_norm_after = (temp_mem_used[machine.id] + task.mem) / machine.mem
 
                 score = ((cpu_norm_after ** k + mem_norm_after ** k) -
                          (cpu_norm_before ** k + mem_norm_before ** k))
@@ -668,9 +673,9 @@ def run_tetris(tasks: List[Task], num_machines: int = 114) -> dict:
                     best_machine = machine
 
             if best_machine:
-                # ✅ 临时更新资源（防止批次内过度分配）
-                best_machine.cpu_used += task.cpu
-                best_machine.mem_used += task.mem
+                # ✅ 更新临时状态（防止批次内过度分配）
+                temp_cpu_used[best_machine.id] += task.cpu
+                temp_mem_used[best_machine.id] += task.mem
                 placements.append((task.id, best_machine.id))
 
         return placements
@@ -1344,8 +1349,14 @@ def run_nextgen_scheduler(tasks: List[Task], num_machines: int = 114) -> dict:
         """
         NextGen 批量调度逻辑
         返回 placements: [(task_id, machine_id), ...]
+        
+        ⚠️ 使用临时状态跟踪批次内的资源分配
         """
         placements = []
+        
+        # ✅ 创建临时状态字典，跟踪批次内的资源分配
+        temp_cpu_used = {m.id: m.cpu_used for m in current_machines}
+        temp_mem_used = {m.id: m.mem_used for m in current_machines}
         
         for task in batch_tasks:
             tid = task.id
@@ -1384,7 +1395,8 @@ def run_nextgen_scheduler(tasks: List[Task], num_machines: int = 114) -> dict:
             use_affinity = os.getenv("NEXTGEN_USE_AFFINITY", "1") == "1"
             
             for machine in current_machines:
-                if machine.cpu_used + cpu > machine.cpu or machine.mem_used + mem > machine.mem:
+                # ✅ 使用临时状态检查资源
+                if temp_cpu_used[machine.id] + cpu > machine.cpu or temp_mem_used[machine.id] + mem > machine.mem:
                     continue
                 penalty = guard.penalty(machine)
                 if penalty >= guard.high_penalty:
@@ -1412,9 +1424,9 @@ def run_nextgen_scheduler(tasks: List[Task], num_machines: int = 114) -> dict:
                     candidate = machine
             
             if candidate:
-                # ✅ 临时更新资源（防止批次内过度分配）
-                candidate.cpu_used += cpu
-                candidate.mem_used += mem
+                # ✅ 更新临时状态（防止批次内过度分配）
+                temp_cpu_used[candidate.id] += cpu
+                temp_mem_used[candidate.id] += mem
                 placements.append((tid, candidate.id))
                 # 更新 selector 状态
                 selector.update_usage(tenant, cpu, mem)
