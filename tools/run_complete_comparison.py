@@ -626,6 +626,9 @@ def run_tetris(tasks: List[Task], num_machines: int = 114) -> dict:
         """
         Tetris 贪心调度逻辑
         SIGCOMM'14 Section 3.2, Equation 1
+        
+        ⚠️ 重要：需要在批次内临时更新 cpu_used/mem_used，
+        防止多个任务过度分配到同一台机器
         """
         placements = []
 
@@ -665,6 +668,9 @@ def run_tetris(tasks: List[Task], num_machines: int = 114) -> dict:
                     best_machine = machine
 
             if best_machine:
+                # ✅ 临时更新资源（防止批次内过度分配）
+                best_machine.cpu_used += task.cpu
+                best_machine.mem_used += task.mem
                 placements.append((task.id, best_machine.id))
 
         return placements
@@ -1406,6 +1412,9 @@ def run_nextgen_scheduler(tasks: List[Task], num_machines: int = 114) -> dict:
                     candidate = machine
             
             if candidate:
+                # ✅ 临时更新资源（防止批次内过度分配）
+                candidate.cpu_used += cpu
+                candidate.mem_used += mem
                 placements.append((tid, candidate.id))
                 # 更新 selector 状态
                 selector.update_usage(tenant, cpu, mem)
