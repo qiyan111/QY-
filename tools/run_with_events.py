@@ -71,7 +71,16 @@ def enable_event_driven_simulation(
     # 当前模拟时间（⭐ 从第一个任务到达时间开始）
     current_time = min(t.arrival for t in tasks) if tasks else 0
     num_scheduling_rounds = 0
-    max_scheduling_rounds = 10000
+    
+    # ⭐ 动态计算最大轮次：基于任务时间跨度和调度间隔
+    if tasks:
+        time_span = max(t.arrival for t in tasks) - min(t.arrival for t in tasks)
+        # 理论需要的轮次 = 时间跨度 / 调度间隔，再加 50% 缓冲
+        theoretical_rounds = int(time_span / batch_step_seconds * 1.5)
+        # 最少 10000，最多 1000000
+        max_scheduling_rounds = max(10000, min(theoretical_rounds, 1000000))
+    else:
+        max_scheduling_rounds = 10000
     
     print(f"  [模拟] 开始时间: {current_time}, 最大轮次: {max_scheduling_rounds}")
     
