@@ -104,10 +104,12 @@ def main():
         print("-" * 105)
         
         for r in results:
+            frag = r.get('frag', 1.0 - r.get('avg_util', 0.0))
+            imbalance = r.get('imbalance', 0.0)
             print(f"{r['name']:<40} {r['success_rate']:>7.1f}% {r['avg_util']*100:>7.1f}% "
                   f"{r['cpu_util']*100:>7.1f}% {r['mem_util']*100:>9.1f}% "
-                  f"{r['frag']*100:>7.1f}% {r['effective_util']*100:>9.1f}% "
-                  f"{r['max_util']*100:>9.1f}% {r.get('imbalance', 0.0)*100:>9.1f}%")
+                  f"{frag*100:>7.1f}% {r['effective_util']*100:>9.1f}% "
+                  f"{r['max_util']*100:>9.1f}% {imbalance*100:>9.1f}%")
         
         print("\n" + "=" * 105)
         
