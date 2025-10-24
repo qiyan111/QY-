@@ -1286,7 +1286,13 @@ def run_slo_driven(tasks: List[Task], num_machines: int = 114) -> dict:
 
 
 def run_nextgen_scheduler(tasks: List[Task], num_machines: int = 114) -> dict:
-    """Next-generation layered scheduler with tenant selection and scoring."""
+    """
+    Next-generation layered scheduler with tenant selection and scoring.
+    
+    ⭐ 修复版本：使用事件驱动模拟，与 Mesos/Tetris 保持一致的采样方式
+    """
+    np.random.seed(2048)
+    random.seed(2048)
     print("\n━━━ [5/5] NextGen Scheduler (Layered) ━━━")
 
     machines = [Machine(id=i, cpu=11.0, mem=11.0) for i in range(num_machines)]
@@ -1300,265 +1306,124 @@ def run_nextgen_scheduler(tasks: List[Task], num_machines: int = 114) -> dict:
     base_low_wm = float(os.getenv("NEXTGEN_LOW_WM", "0.60"))
     base_high_wm = float(os.getenv("NEXTGEN_HIGH_WM", "0.92"))
     guard = WatermarkGuard(low=base_low_wm, high=base_high_wm)
-    retry_q = RetryQueue(ttl_ms=5_000, max_attempts=2)
     forecast = EWMA(alpha=0.4)
     base_alpha = float(os.getenv("NEXTGEN_ALPHA", "0.85"))
     residual_controller = ResidualController(selector)
-
-    sorted_tasks = sorted(tasks, key=lambda t: t.arrival)
-    if not sorted_tasks:
-        return {
-            "name": "NextGen Scheduler (Prototype)",
-            "scheduled": 0,
-            "failed": 0,
-            "machines": machines,
-        }
-
-    attempts = defaultdict(int)
-
-    current_time = sorted_tasks[0].arrival
-    for task in sorted_tasks:
-        selector.add_task((task.id, task.cpu, task.mem, task.tenant, task.arrival), now_ms=task.arrival)
-
-    total_tasks = len(sorted_tasks)
-    scheduled = 0
-    failed = 0
-
+    
+    # 用于在批量调度函数中共享状态
     global_stats = {
         "avg_util": 0.0,
         "fragmentation": 0.0,
         "imbalance": 0.0,
     }
+    task_dict = {t.id: t for t in tasks}
 
-    # 动态资源管理启用标志
-    use_dynamic_release = os.getenv("NEXTGEN_DYNAMIC_RELEASE", "1") == "1"
-    total_released = 0
-
-    # ⭐ 过程采样（与事件驱动模式保持一致）
-    util_samples = []
-    cpu_util_samples = []
-    mem_util_samples = []
-    real_cpu_samples = []
-    max_util_seen = 0.0
-    sample_interval = 100  # 每100个任务采样一次
-
-    while scheduled + failed < total_tasks:
-        # ⭐ 每次迭代开始时释放已完成任务的资源
-        if use_dynamic_release:
-            released_count = sum(m.release_completed_tasks(current_time) for m in machines)
-            if released_count > 0:
-                total_released += released_count
-
-        while True:
-            ready = retry_q.pop_ready(current_time)
-            if not ready:
-                break
-            retry_task, old_attempts = ready
-            attempts[retry_task[0]] = old_attempts
-            selector.add_task(retry_task, now_ms=current_time)
-
-        if not selector.has_pending():
-            if retry_q.has_ready(current_time):
-                current_time = retry_q.next_deadline() or current_time
-                continue
-            break
-
-        task_tuple = selector.pop_next(now_ms=current_time)
-        if task_tuple is None:
-            next_deadline = retry_q.next_deadline()
-            if next_deadline is None:
-                break
-            current_time = max(current_time + 1, next_deadline)
-            continue
-
-        tid, cpu, mem, tenant, arrival = task_tuple
-        current_time = max(current_time, arrival)
-
-        state_vec, group_queues = residual_controller.build_state(machines, global_stats)
-        # RL 模型推理 - 输出残差调整动作
-        if ppo_model:
-            # 调整状态向量维度以匹配训练时的环境（15维）
-            state_input = np.array(state_vec[:15], dtype=np.float32)  # 取前15维
-            if len(state_vec) < 15:
-                # 如果不够15维，用0填充
-                state_input = np.pad(state_input, (0, 15 - len(state_vec)), 'constant')
-
-            action_vec, _ = ppo_model.predict(state_input, deterministic=True)
-            residual_action = {
-                "delta_alpha": float(action_vec[0]),
-                "delta_high_wm": float(action_vec[1]),
-                "delta_low_wm": float(action_vec[2]),
-                "group_delta": {}
-            }
-        else:
-            residual_action = {}
-        alpha, high_wm, low_wm, group_weights = residual_controller.apply_residuals(
-            residual_action,
-            base_alpha,
-            base_high_wm,
-            base_low_wm,
-        )
-        guard.low = low_wm
-        guard.high = high_wm
-        if group_weights:
-            selector.update_group_weights(group_weights)
-
-        candidate = None
-        best_score = float("inf")
-
-        # 获取当前任务的完整信息（包含 machine_id 等）
-        task_obj = next((t for t in tasks if t.id == tid), None)
-        use_affinity = os.getenv("NEXTGEN_USE_AFFINITY", "1") == "1"
-
-        for machine in machines:
-            if machine.cpu_used + cpu > machine.cpu or machine.mem_used + mem > machine.mem:
-                continue
-            penalty = guard.penalty(machine)
-            if penalty >= guard.high_penalty:
-                continue
-            forecast.update(machine.id, machine.utilization())
-
-            # 使用真实的task对象以支持亲和性和多维资源
-            if task_obj:
-                # 准备多维资源字典
+    # ⭐ 定义批量调度函数（封装 NextGen 的核心逻辑）
+    def nextgen_schedule_batch(batch_tasks, current_machines):
+        """
+        NextGen 批量调度逻辑
+        返回 placements: [(task_id, machine_id), ...]
+        """
+        placements = []
+        
+        for task in batch_tasks:
+            tid = task.id
+            cpu = task.cpu
+            mem = task.mem
+            tenant = task.tenant
+            arrival = task.arrival
+            
+            # 状态更新和 RL 推理
+            state_vec, group_queues = residual_controller.build_state(current_machines, global_stats)
+            if ppo_model:
+                state_input = np.array(state_vec[:15], dtype=np.float32)
+                if len(state_vec) < 15:
+                    state_input = np.pad(state_input, (0, 15 - len(state_vec)), 'constant')
+                action_vec, _ = ppo_model.predict(state_input, deterministic=True)
+                residual_action = {
+                    "delta_alpha": float(action_vec[0]),
+                    "delta_high_wm": float(action_vec[1]),
+                    "delta_low_wm": float(action_vec[2]),
+                    "group_delta": {}
+                }
+            else:
+                residual_action = {}
+            
+            alpha, high_wm, low_wm, group_weights = residual_controller.apply_residuals(
+                residual_action, base_alpha, base_high_wm, base_low_wm
+            )
+            guard.low = low_wm
+            guard.high = high_wm
+            if group_weights:
+                selector.update_group_weights(group_weights)
+            
+            # 选择最佳节点
+            candidate = None
+            best_score = float("inf")
+            use_affinity = os.getenv("NEXTGEN_USE_AFFINITY", "1") == "1"
+            
+            for machine in current_machines:
+                if machine.cpu_used + cpu > machine.cpu or machine.mem_used + mem > machine.mem:
+                    continue
+                penalty = guard.penalty(machine)
+                if penalty >= guard.high_penalty:
+                    continue
+                forecast.update(machine.id, machine.utilization())
+                
+                # 准备多维资源
                 extra_dims = {}
-                if hasattr(task_obj, 'mem_bandwidth') and task_obj.mem_bandwidth > 0:
+                if hasattr(task, 'mem_bandwidth') and task.mem_bandwidth > 0:
                     extra_dims['mem_bandwidth'] = machine.mem_bandwidth_cap - machine.mem_bandwidth
-                if hasattr(task_obj, 'net_in') and task_obj.net_in > 0:
+                if hasattr(task, 'net_in') and task.net_in > 0:
                     extra_dims['net_bandwidth'] = machine.net_bandwidth_cap - machine.net_bandwidth
-
+                
                 util_score = score_node(
-                    machine,
-                    task_obj,
-                    alpha=alpha,
+                    machine, task, alpha=alpha,
                     extra_dims=extra_dims if extra_dims else None,
                     use_affinity=use_affinity,
                     affinity_bonus=0.05,
                 )
-            else:
-                # fallback：创建临时任务对象
-                util_score = score_node(
-                    machine,
-                    Task(tid, cpu, mem, tenant, arrival, "", 0),
-                    alpha=alpha,
-                )
-
-            util_forecast = forecast.forecast(machine.id)
-            total_score = util_score * penalty + 0.05 * util_forecast
-            if total_score < best_score:
-                best_score = total_score
-                candidate = machine
-
-        if candidate:
-            # ⭐ 使用动态资源管理方法添加任务
-            if use_dynamic_release and task_obj and task_obj.duration > 0:
-                # 准备额外资源字典
-                extra_res = {}
-                if hasattr(task_obj, 'mem_bandwidth') and task_obj.mem_bandwidth > 0:
-                    extra_res['mem_bandwidth'] = task_obj.mem_bandwidth
-                if hasattr(task_obj, 'net_in') and task_obj.net_in > 0:
-                    extra_res['net_bandwidth'] = task_obj.net_in + task_obj.net_out
-                if hasattr(task_obj, 'disk_io') and task_obj.disk_io > 0:
-                    extra_res['disk_io'] = task_obj.disk_io
-
-                candidate.add_task(tid, tenant, current_time, task_obj.duration,
-                                   cpu, mem, **extra_res)
-            else:
-                # 回退到静态模式（兼容无duration数据的情况）
-                candidate.cpu_used += cpu
-                candidate.mem_used += mem
-                candidate.tasks.append((tid, tenant))
-                # 更新多维资源使用
-                if task_obj:
-                    if hasattr(task_obj, 'mem_bandwidth'):
-                        candidate.mem_bandwidth += task_obj.mem_bandwidth
-                    if hasattr(task_obj, 'net_in'):
-                        candidate.net_bandwidth += (task_obj.net_in + task_obj.net_out)
-                    if hasattr(task_obj, 'disk_io'):
-                        candidate.disk_io += task_obj.disk_io
-
-            selector.update_usage(tenant, cpu, mem)
-            scheduled += 1
-            attempts.pop(tid, None)
-        else:
-            attempt_count = attempts[tid] + 1
-            if attempt_count >= retry_q.max_attempts:
-                failed += 1
-                attempts.pop(tid, None)
-            else:
-                attempts[tid] = attempt_count
-                retry_q.push(task_tuple, now_ms=current_time, attempts=attempt_count)
-
-        # Update global stats for next step
-        avg_util, max_util, std_util = cpu_mem_util(machines)
-        frag = fragmentation(machines)
-        imb = imbalance(machines)
+                
+                util_forecast = forecast.forecast(machine.id)
+                total_score = util_score * penalty + 0.05 * util_forecast
+                if total_score < best_score:
+                    best_score = total_score
+                    candidate = machine
+            
+            if candidate:
+                placements.append((tid, candidate.id))
+                # 更新 selector 状态
+                selector.update_usage(tenant, cpu, mem)
+        
+        # 更新全局统计
+        avg_util, max_util, std_util = cpu_mem_util(current_machines)
+        frag = fragmentation(current_machines)
+        imb = imbalance(current_machines)
         global_stats.update({
             "avg_util": avg_util,
             "fragmentation": frag,
             "imbalance": imb,
         })
-
-        # ⭐ 过程采样（每隔一定任务数采样一次）
-        if (scheduled + failed) % sample_interval == 0:
-            current_utils = [m.utilization() for m in machines]
-            cpu_utils = [m.cpu_used / m.cpu if m.cpu > 0 else 0 for m in machines]
-            mem_utils = [m.mem_used / m.mem if m.mem > 0 else 0 for m in machines]
-
-            if current_utils:
-                util_samples.append(sum(current_utils) / len(current_utils))
-                cpu_util_samples.append(sum(cpu_utils) / len(cpu_utils))
-                mem_util_samples.append(sum(mem_utils) / len(mem_utils))
-                max_util_seen = max(max_util_seen, max(current_utils))
-
-                # 采样真实CPU使用
-                if use_dynamic_release:
-                    real_cpu_now = 0.0
-                    for m in machines:
-                        for task_info in m.active_tasks:
-                            tid = task_info['tid']
-                            task_obj = next((t for t in sorted_tasks if t.id == tid), None)
-                            if task_obj:
-                                real_cpu_now += getattr(task_obj, 'real_cpu', task_info['cpu'] * 0.5)
-                    real_cpu_samples.append(real_cpu_now)
-
-    # 计算过程平均指标（与事件驱动模式一致）
-    avg_util_over_time = sum(util_samples) / len(util_samples) if util_samples else 0.0
-    avg_cpu_util = sum(cpu_util_samples) / len(cpu_util_samples) if cpu_util_samples else 0.0
-    avg_mem_util = sum(mem_util_samples) / len(mem_util_samples) if mem_util_samples else 0.0
-
-    capacity_total = sum(m.cpu for m in machines)
-    avg_real_cpu = sum(real_cpu_samples) / len(real_cpu_samples) if real_cpu_samples else 0.0
-    effective_util_over_time = avg_real_cpu / capacity_total if capacity_total > 0 else 0.0
-
-    # 输出动态资源管理统计
-    if use_dynamic_release:
-        active_task_count = sum(len(m.active_tasks) for m in machines)
-        print(f"\n  [动态资源管理]")
-        print(f"    已调度任务: {scheduled}")
-        print(f"    已完成释放: {total_released}")
-        print(f"    仍在运行: {active_task_count}")
-        print(f"    资源释放率: {total_released / max(scheduled, 1) * 100:.1f}%")
-        print(f"    采样次数: {len(util_samples)}")
-        print(f"    过程平均利用率: {avg_util_over_time * 100:.1f}%")
-        print(f"    过程平均真实利用率: {effective_util_over_time * 100:.1f}%")
-
-    return {
-        "name": "NextGen Scheduler (Prototype)",
-        "scheduled": scheduled,
-        "failed": failed,
-        "machines": machines,
-        "state": global_stats,
-        "total_released": total_released if use_dynamic_release else 0,
-        "active_tasks": sum(len(m.active_tasks) for m in machines) if use_dynamic_release else 0,
-        # ⭐ 添加过程采样数据（与事件驱动保持一致）
-        "avg_util_over_time": avg_util_over_time,
-        "max_util_seen": max_util_seen,
-        "avg_cpu_util": avg_cpu_util,
-        "avg_mem_util": avg_mem_util,
-        "effective_util_over_time": effective_util_over_time,
-        "all_scheduled_task_ids": [t.id for t in sorted_tasks[:scheduled]],
-    }
+        
+        return placements
+    
+    # ⭐ 启用事件驱动模拟（与 Mesos/Tetris 保持一致）
+    durations = [t.duration for t in tasks if t.duration > 0]
+    median_duration = int(np.median(durations)) if durations else 60
+    recommended_step = max(1, min(median_duration // 2, 60))
+    batch_step = int(os.getenv("BATCH_STEP_SECONDS", str(recommended_step)))
+    
+    print(f"  [事件驱动] 调度间隔={batch_step}秒 (任务中位时长={median_duration}秒)")
+    
+    result = enable_event_driven_simulation(
+        baseline_scheduler_func=nextgen_schedule_batch,
+        tasks=tasks,
+        machines=machines,
+        batch_step_seconds=batch_step,
+    )
+    
+    result["name"] = "NextGen Scheduler (Prototype)"
+    return result
 
 
 def analyze_result(result: dict, trace_dir: str, tasks: List[Task]) -> dict:
