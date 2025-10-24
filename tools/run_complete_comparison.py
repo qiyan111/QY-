@@ -1756,6 +1756,25 @@ def analyze_result(result: dict, trace_dir: str, tasks: List[Task]) -> dict:
 
     total = result["scheduled"] + result["failed"]
 
+    # 可选：时间窗口内的成功率（按 submit/start 落在窗口内统计）
+    # 环境变量：WINDOW_START_SECONDS, WINDOW_HOURS
+    window_start_env = os.getenv("WINDOW_START_SECONDS")
+    window_hours_env = os.getenv("WINDOW_HOURS")
+    success_rate = None
+    if window_start_env and window_hours_env and isinstance(result, dict) and 'timelines' in result:
+        try:
+            w_start = int(float(window_start_env))
+            w_end = w_start + int(float(window_hours_env) * 3600)
+            # 窗口内到达的任务
+            arrived_in_window = {str(t.id) for t in tasks if w_start <= int(getattr(t, 'arrival', 0)) < w_end}
+            # 窗口内开始执行（被调度）的任务
+            timelines = result.get('timelines', {})
+            scheduled_in_window = {tid for tid, tl in timelines.items() if isinstance(tl, dict) and tl.get('start') is not None and w_start <= int(tl.get('start')) < w_end}
+            denom = max(len(arrived_in_window), 1)
+            success_rate = len(scheduled_in_window) / denom
+        except Exception:
+            success_rate = None
+
     # ----- DEBUG: per-algorithm request size and usage summary -----
     import numpy as np
 
@@ -1837,7 +1856,7 @@ def analyze_result(result: dict, trace_dir: str, tasks: List[Task]) -> dict:
         "machines": machines,
         "scheduled": result["scheduled"],
         "failed": result["failed"],
-        "success_rate": result["scheduled"] / max(total, 1),
+        "success_rate": success_rate if success_rate is not None else (result["scheduled"] / max(total, 1)),
         "avg_util": avg_util,
         "max_util": max_util,
         "std_util": std_util,
