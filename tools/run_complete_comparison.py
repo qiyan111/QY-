@@ -1443,6 +1443,9 @@ def analyze_result(result: dict, trace_dir: str, tasks: List[Task]) -> dict:
         # 事件驱动模式：使用过程中采样计算的平均真实利用率
         effective_util = result['effective_util_over_time']
         waste_rate = 1.0 - effective_util
+        # ⭐ 计算 real_used 用于调试输出
+        capacity_total = len(machines) * 11.0
+        real_used = effective_util * capacity_total
     else:
         # 静态模式：基于最终快照计算
         real_used = 0.0
