@@ -521,10 +521,15 @@ def run_firmament(tasks: List[Task], num_machines: int = 114) -> dict:
     # 调度间隔应小于任务平均时长的一半，确保任务有重叠
     durations = [t.duration for t in tasks if t.duration > 0]
     median_duration = int(np.median(durations)) if durations else 60
-    recommended_step = max(1, min(median_duration // 2, 60))  # 中位时长的一半，最多60秒
-    batch_step = int(os.getenv("BATCH_STEP_SECONDS", str(recommended_step)))
-
-    print(f"  [事件驱动] 调度间隔={batch_step}秒 (任务中位时长={median_duration}秒)")
+    # ⭐ 优先使用环境变量，否则智能推荐（任务时长的20%，最少3秒）
+    env_step = os.getenv("BATCH_STEP_SECONDS")
+    if env_step:
+        batch_step = int(env_step)
+        print(f"  [事件驱动] 调度间隔={batch_step}秒 ⭐环境变量⭐ (任务中位时长={median_duration}秒)")
+    else:
+        recommended_step = max(3, min(median_duration // 5, 30))  # 任务时长的20%
+        batch_step = recommended_step
+        print(f"  [事件驱动] 调度间隔={batch_step}秒 (智能推荐, 任务中位时长={median_duration}秒)")
 
     result = enable_event_driven_simulation(
         baseline_scheduler_func=firmament_schedule_batch,
@@ -583,10 +588,15 @@ def run_mesos_drf(tasks: List[Task], num_machines: int = 114) -> dict:
     # 对应 mesos master 的异步消息驱动架构
     durations = [t.duration for t in tasks if t.duration > 0]
     median_duration = int(np.median(durations)) if durations else 60
-    recommended_step = max(1, min(median_duration // 2, 60))
-    batch_step = int(os.getenv("BATCH_STEP_SECONDS", str(recommended_step)))
-
-    print(f"  [事件驱动] 调度间隔={batch_step}秒 (任务中位时长={median_duration}秒)")
+    # ⭐ 优先使用环境变量，否则智能推荐（任务时长的20%，最少3秒）
+    env_step = os.getenv("BATCH_STEP_SECONDS")
+    if env_step:
+        batch_step = int(env_step)
+        print(f"  [事件驱动] 调度间隔={batch_step}秒 ⭐环境变量⭐ (任务中位时长={median_duration}秒)")
+    else:
+        recommended_step = max(3, min(median_duration // 5, 30))  # 任务时长的20%
+        batch_step = recommended_step
+        print(f"  [事件驱动] 调度间隔={batch_step}秒 (智能推荐, 任务中位时长={median_duration}秒)")
 
     result = enable_event_driven_simulation(
         baseline_scheduler_func=mesos_schedule_batch,
@@ -662,10 +672,15 @@ def run_tetris(tasks: List[Task], num_machines: int = 114) -> dict:
     # ⭐ 启用事件驱动模拟（自动资源释放）
     durations = [t.duration for t in tasks if t.duration > 0]
     median_duration = int(np.median(durations)) if durations else 60
-    recommended_step = max(1, min(median_duration // 2, 60))
-    batch_step = int(os.getenv("BATCH_STEP_SECONDS", str(recommended_step)))
-
-    print(f"  [事件驱动] 调度间隔={batch_step}秒 (任务中位时长={median_duration}秒)")
+    # ⭐ 优先使用环境变量，否则智能推荐（任务时长的20%，最少3秒）
+    env_step = os.getenv("BATCH_STEP_SECONDS")
+    if env_step:
+        batch_step = int(env_step)
+        print(f"  [事件驱动] 调度间隔={batch_step}秒 ⭐环境变量⭐ (任务中位时长={median_duration}秒)")
+    else:
+        recommended_step = max(3, min(median_duration // 5, 30))  # 任务时长的20%
+        batch_step = recommended_step
+        print(f"  [事件驱动] 调度间隔={batch_step}秒 (智能推荐, 任务中位时长={median_duration}秒)")
 
     result = enable_event_driven_simulation(
         baseline_scheduler_func=tetris_schedule_batch,
