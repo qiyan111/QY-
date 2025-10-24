@@ -11,7 +11,7 @@
 import sys
 import os
 sys.path.insert(0, 'tools')
-from load_trace_final import load_tasks
+from load_trace_final import load_alibaba_trace_final
 import pickle
 import numpy as np
 
@@ -108,7 +108,7 @@ def main():
     
     # 加载任务
     print("📂 加载 Alibaba Trace...")
-    all_tasks = load_tasks('./data', max_instances=max_tasks)
+    all_tasks = load_alibaba_trace_final('./data', max_inst=max_tasks)
     print(f"  ✅ 加载了 {len(all_tasks)} 个任务")
     
     # 分析原始trace
