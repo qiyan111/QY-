@@ -63,48 +63,75 @@ def enable_event_driven_simulation(
     
     # ⭐ 追踪所有已调度任务（用于计算 effective_util）
     all_scheduled_tasks = []  # 存储所有已调度任务的 ID
+    # ⭐ 任务时间线（用于 JCT/SLO 计算）：tid -> {submit,start,end}
+    timelines: Dict[str, Dict[str, int]] = {}
+    # ⭐ 任务时间线（用于 JCT/SLO 计算）：tid -> {submit,start,end}
+    timelines: Dict[str, Dict[str, int]] = {}
     
     # 统计
     scheduled_count = 0
     failed_count = 0
     
-    # 当前模拟时间（⭐ 从第一个任务到达时间开始）
-    current_time = min(t.arrival for t in tasks) if tasks else 0
+    # 当前模拟时间与调度节拍（⭐ 从第一个任务到达时间开始）
+    start_time = min(t.arrival for t in tasks) if tasks else 0
+    current_time = start_time
+    next_schedule_at = start_time
     num_scheduling_rounds = 0
-    max_scheduling_rounds = 10000
+    # 允许通过环境变量调整最大轮次，避免大规模 trace 被过早截断
+    max_scheduling_rounds = int(os.getenv("MAX_SCHED_ROUNDS", "1000000"))
     
     print(f"  [模拟] 开始时间: {current_time}, 最大轮次: {max_scheduling_rounds}")
     
-    # 待调度任务缓冲区
+    # 待调度任务缓冲区（在调度节拍之间持续累积）
     pending_tasks = []
     
     # ⭐ 追踪过程中的利用率（解决"最终快照"问题）
-    util_samples = []  # 每个调度轮次的利用率快照
+    util_samples = []  # 每个调度轮次的利用率快照（调试用）
     cpu_util_samples = []  # CPU 利用率快照
     mem_util_samples = []  # MEM 利用率快照
     real_cpu_samples = []  # 真实 CPU 使用量快照
+    cv_samples = []       # 节点利用率变异系数快照（不均衡度）
     max_util_seen = 0.0
+    # 时间加权积分（AUC）
+    tw_util_sum = 0.0
+    tw_cpu_sum = 0.0
+    tw_mem_sum = 0.0
+    tw_real_cpu_sum = 0.0
+    tw_cv_sum = 0.0
+    tw_total = 0.0
     
+    # 负载与波动门限（模仿论文常用“稳态窗口/忙时窗口”处理）
+    busy_util_min = float(os.getenv("BUSY_UTIL_MIN", "0.05"))      # 仅当 AvgUtil≥此值才计入时间加权
+    cv_min_mean_util = float(os.getenv("CV_MIN_MEAN_UTIL", "0.05"))  # 仅当 AvgUtil≥此值才计算CV
+    # 采样/调度子采样：每 N 个节拍才执行一次完整调度（近似法，加速）
+    subsample = int(os.getenv("SCHEDULE_SUBSAMPLE", "1"))
+    subsample = max(1, subsample)
+
     # ========== 主模拟循环（对应 Firmament 的 ReplaySimulation while 循环）==========
     debug_round = 0
-    while events or running_tasks:
+    while events or running_tasks or pending_tasks:
         if num_scheduling_rounds >= max_scheduling_rounds:
             print(f"  [循环] 达到最大调度轮次限制: {max_scheduling_rounds}")
             break
-        
+
+        # 如果没有任何负载且无待调度任务，则将 next_schedule_at 对齐到下一个事件时间以避免空转
+        if not running_tasks and not pending_tasks and events:
+            next_schedule_at = max(next_schedule_at, events[0][0])
+            current_time = next_schedule_at
+
         # ⭐ 调试：每1000轮输出一次状态（减少刷屏）
         if os.getenv("DEBUG_EVENT_LOOP", "0") == "1" and debug_round == 0 and num_scheduling_rounds % 1000 == 0:
-            print(f"  [循环 {num_scheduling_rounds}] current_time={current_time}, "
+            print(f"  [循环 {num_scheduling_rounds}] schedule_at={next_schedule_at}, "
                   f"events={len(events)}, running={len(running_tasks)}, pending={len(pending_tasks)}")
             if events:
                 print(f"              next_event_time={events[0][0]}")
             debug_round = 1000
         debug_round -= 1
-        
-        # ========== 步骤 1: 处理所有 <= current_time 的事件 ==========
+
+        # ========== 步骤 1: 处理所有 <= next_schedule_at 的事件 ==========
         # 对应 bridge->ProcessSimulatorEvents(run_scheduler_at)
         events_processed = 0
-        while events and events[0][0] <= current_time:
+        while events and events[0][0] <= next_schedule_at:
             timestamp, _, event_type, data = heapq.heappop(events)
             events_processed += 1
             
@@ -130,18 +157,30 @@ def enable_event_driven_simulation(
                         framework_id = resources.get('tenant', resources.get('framework_id', ''))
                         allocator_obj.recover_resources(framework_id, machine_id, 
                                                        resources['cpu'], resources['mem'])
+                    # 记录结束时间
+                    try:
+                        timelines.setdefault(str(task_id), {})['end'] = timestamp
+                    except Exception:
+                        pass
             
             elif event_type == 'TASK_SUBMIT':
-                # 任务到达，加入待调度队列
+                # 任务到达，加入待调度队列（累积到下一次调度）
                 pending_tasks.append(data)
+                # 记录提交时间
+                try:
+                    tid_ = str(getattr(data, 'id', ''))
+                    if tid_:
+                        timelines.setdefault(tid_, {}).setdefault('submit', timestamp)
+                except Exception:
+                    pass
         
         # ⭐ 调试：如果处理了很多事件但没有待调度任务，说明有问题
         if os.getenv("DEBUG_EVENT_LOOP", "0") == "1" and events_processed > 0 and num_scheduling_rounds < 10:
             print(f"  [步骤1] 处理了 {events_processed} 个事件, pending_tasks={len(pending_tasks)}")
         
-        # ========== 步骤 2: 运行调度器 ==========
+        # ========== 步骤 2: 运行调度器（仅在调度节拍触发时运行，支持子采样） ==========
         # 对应 ScheduleJobsHelper
-        if pending_tasks:
+        if pending_tasks and (num_scheduling_rounds % subsample == 0):
             # ⭐ 调试：第一轮调度
             if os.getenv("DEBUG_EVENT_LOOP", "0") == "1" and num_scheduling_rounds < 3:
                 print(f"  [步骤2] 调度轮次 {num_scheduling_rounds}: 尝试调度 {len(pending_tasks)} 个任务")
@@ -161,6 +200,8 @@ def enable_event_driven_simulation(
             
             # 处理调度结果
             scheduled_ids = set()
+            # 使用当前调度节拍时间作为放置时间
+            schedule_time = next_schedule_at
             for task_id, machine_id in placements:
                 task = task_dict.get(task_id)
                 if not task:
@@ -182,9 +223,14 @@ def enable_event_driven_simulation(
                 scheduled_count += 1
                 all_scheduled_tasks.append(task_id)  # ⭐ 记录所有已调度任务
                 
+                # 记录开始时间
+                try:
+                    timelines.setdefault(str(task_id), {}).setdefault('start', schedule_time)
+                except Exception:
+                    pass
                 # ⭐ 添加任务结束事件（对应 OnTaskPlacement -> UpdateTaskEndEvents）
                 if hasattr(task, 'duration') and task.duration > 0:
-                    end_time = current_time + task.duration
+                    end_time = schedule_time + task.duration
                     heapq.heappush(events, (end_time, event_counter, 'TASK_END_RUNTIME', task_id))
                     event_counter += 1
                     
@@ -196,83 +242,100 @@ def enable_event_driven_simulation(
                         'framework_id': task.tenant if hasattr(task, 'tenant') else '',
                     })
             
-            # 记录调度失败的任务
-            for task in pending_tasks:
-                if task.id not in scheduled_ids:
-                    failed_count += 1
-            
-            pending_tasks = []
+            # 未调度任务不判定为失败，保留到下一轮（与真实系统一致）
+            # 只有在模拟结束仍未被调度时，才可作为失败统计（本模拟暂不计算该项）
+            pending_tasks = [t for t in pending_tasks if t.id not in scheduled_ids]
         
         # ========== 步骤 3: 采样当前利用率（用于计算平均/峰值）==========
-        # ⭐ 只在有运行中的任务时才采样（避免空闲时间稀释利用率）
-        if running_tasks or len([m for m in machines if m.cpu_used > 0 or m.mem_used > 0]) > 0:
-            current_utils = [max(m.cpu_used/m.cpu if m.cpu > 0 else 0, 
-                                m.mem_used/m.mem if m.mem > 0 else 0) for m in machines]
+        have_load = running_tasks or any((m.cpu_used > 0 or m.mem_used > 0) for m in machines)
+        avg_util_now = cpu_util_now = mem_util_now = real_cpu_now = cv_now = 0.0
+        if have_load:
+            current_utils = [max(m.cpu_used/m.cpu if m.cpu > 0 else 0,
+                                 m.mem_used/m.mem if m.mem > 0 else 0) for m in machines]
             cpu_utils = [m.cpu_used/m.cpu if m.cpu > 0 else 0 for m in machines]
             mem_utils = [m.mem_used/m.mem if m.mem > 0 else 0 for m in machines]
-            
+
             # ⭐ 计算当前时刻运行中任务的真实CPU使用量
             real_cpu_now = 0.0
-            for tid, (mid, end_time, res) in running_tasks.items():
+            for tid, (_mid, _end_time, res) in running_tasks.items():
                 task = task_dict.get(tid)
                 if task:
                     real_cpu_now += getattr(task, 'real_cpu', res['cpu'] * 0.5)
-            
+
             if current_utils:
                 avg_util_now = sum(current_utils) / len(current_utils)
                 max_util_now = max(current_utils)
-                cpu_util_now = sum(cpu_utils) / len(cpu_utils) if cpu_utils else 0
-                mem_util_now = sum(mem_utils) / len(mem_utils) if mem_utils else 0
-                
+                cpu_util_now = sum(cpu_utils) / len(cpu_utils) if cpu_utils else 0.0
+                mem_util_now = sum(mem_utils) / len(mem_utils) if mem_utils else 0.0
+                # 变异系数（不均衡度）- 仅在平均≥阈值时计算，避免接近0时爆炸
+                mean_u = avg_util_now
+                if mean_u >= cv_min_mean_util:
+                    var = sum((u - mean_u) ** 2 for u in current_utils) / len(current_utils)
+                    std_u = var ** 0.5
+                    cv_now = std_u / mean_u
+                else:
+                    cv_now = 0.0
+
                 util_samples.append(avg_util_now)
                 cpu_util_samples.append(cpu_util_now)
                 mem_util_samples.append(mem_util_now)
                 real_cpu_samples.append(real_cpu_now)  # ⭐ 采样真实CPU使用量
+                cv_samples.append(cv_now)
                 max_util_seen = max(max_util_seen, max_util_now)
-        
-        # ========== 步骤 4: 推进到下一个事件时间 ==========
-        # ⭐ 改进：直接跳转到下一个事件时间（避免空转）
-        if events:
-            next_event_time = events[0][0]
-            if running_tasks:
-                # 有任务在运行：按固定间隔推进（等待任务完成）
-                current_time = min(current_time + batch_step_seconds, next_event_time)
-            else:
-                # 没有任务运行：直接跳到下一个事件（避免空转）
-                current_time = next_event_time
-        else:
-            # 没有更多事件：按固定间隔推进（等待运行中任务完成）
-            if running_tasks:
-                current_time += batch_step_seconds
-            else:
-                # 没有事件也没有运行中任务，结束模拟
-                break
+
+        # ========== 步骤 4: 推进到下一个调度节拍（并做时间加权积分） ==========
+        # 以区间长度做时间加权： [current_time, next_schedule_at)
+        next_time = next_schedule_at + batch_step_seconds * subsample
+
+        # 时间加权积分（使用本轮采样的状态覆盖 [current_time, next_time)）
+        # 仅当 AvgUtil 达到“忙时”阈值时计入时间加权，模仿论文去除冷启动/冷却期
+        if have_load and avg_util_now >= busy_util_min:
+            delta_t = max(0, (next_time - next_schedule_at))
+            if delta_t > 0:
+                tw_total += delta_t
+                tw_util_sum += avg_util_now * delta_t
+                tw_cpu_sum += cpu_util_now * delta_t
+                tw_mem_sum += mem_util_now * delta_t
+                tw_real_cpu_sum += real_cpu_now * delta_t
+                tw_cv_sum += cv_now * delta_t
+
+        current_time = next_time
+        next_schedule_at = next_time
         
         num_scheduling_rounds += 1
         
-        # 如果没有更多事件且没有运行中的任务，提前结束
+        # 如果没有更多事件且没有运行中的任务且无待调度任务，提前结束
         if not events and not running_tasks and not pending_tasks:
             break
     
     # 最终统计
-    # ⭐ 计算过程中的平均利用率（而不是最终快照）
-    avg_util_over_time = sum(util_samples) / len(util_samples) if util_samples else 0.0
-    avg_cpu_util = sum(cpu_util_samples) / len(cpu_util_samples) if cpu_util_samples else 0.0
-    avg_mem_util = sum(mem_util_samples) / len(mem_util_samples) if mem_util_samples else 0.0
-    
-    # ⭐ 计算时间加权的真实CPU利用率（而不是累计总和）
-    capacity_total = sum(m.cpu for m in machines)
-    avg_real_cpu = sum(real_cpu_samples) / len(real_cpu_samples) if real_cpu_samples else 0.0
-    effective_util_over_time = avg_real_cpu / capacity_total if capacity_total > 0 else 0.0
+    # ⭐ 计算时间加权均值（若无时间窗口，则退化为算术平均）
+    if tw_total > 0:
+        avg_util_over_time = tw_util_sum / tw_total
+        avg_cpu_util = tw_cpu_sum / tw_total
+        avg_mem_util = tw_mem_sum / tw_total
+        capacity_total = sum(m.cpu for m in machines)
+        avg_real_cpu = tw_real_cpu_sum / tw_total
+        effective_util_over_time = avg_real_cpu / capacity_total if capacity_total > 0 else 0.0
+        imbalance_over_time = tw_cv_sum / tw_total
+    else:
+        avg_util_over_time = sum(util_samples) / len(util_samples) if util_samples else 0.0
+        avg_cpu_util = sum(cpu_util_samples) / len(cpu_util_samples) if cpu_util_samples else 0.0
+        avg_mem_util = sum(mem_util_samples) / len(mem_util_samples) if mem_util_samples else 0.0
+        capacity_total = sum(m.cpu for m in machines)
+        avg_real_cpu = sum(real_cpu_samples) / len(real_cpu_samples) if real_cpu_samples else 0.0
+        effective_util_over_time = avg_real_cpu / capacity_total if capacity_total > 0 else 0.0
+        imbalance_over_time = sum(cv_samples) / len(cv_samples) if cv_samples else 0.0
     
     # ⭐ 调试输出
     print(f"\n  [事件驱动统计]")
     print(f"    调度轮次: {num_scheduling_rounds}")
     print(f"    已调度: {scheduled_count}, 失败: {failed_count}")
     print(f"    采样次数: {len(util_samples)} (有任务运行时才采样)")
-    print(f"    过程平均利用率(请求): {avg_util_over_time*100:.1f}%")
-    print(f"    过程平均CPU利用率(请求): {avg_cpu_util*100:.1f}%")
-    print(f"    过程平均真实利用率: {effective_util_over_time*100:.1f}%")
+    print(f"    过程平均利用率(时间加权): {avg_util_over_time*100:.1f}%")
+    print(f"    过程平均CPU利用率(时间加权): {avg_cpu_util*100:.1f}%")
+    print(f"    过程平均真实利用率(时间加权): {effective_util_over_time*100:.1f}%")
+    print(f"    过程不均衡CV(时间加权): {imbalance_over_time*100:.1f}%")
     print(f"    峰值利用率: {max_util_seen*100:.1f}%")
     print(f"    已释放任务: {scheduled_count - len(running_tasks)}")
     print(f"    仍在运行: {len(running_tasks)}")
@@ -292,6 +355,7 @@ def enable_event_driven_simulation(
         "avg_cpu_util": avg_cpu_util,              # ⭐ 过程中的平均 CPU 利用率（请求量）
         "avg_mem_util": avg_mem_util,              # ⭐ 过程中的平均 MEM 利用率（请求量）
         "effective_util_over_time": effective_util_over_time,  # ⭐ 过程中的平均真实CPU利用率
+        "imbalance_over_time": imbalance_over_time,            # ⭐ 过程中的平均不均衡CV
         "total_released": scheduled_count - len(running_tasks),  # 已释放任务数（修正计算）
         "all_scheduled_task_ids": all_scheduled_tasks,  # ⭐ 所有已调度任务ID
     }

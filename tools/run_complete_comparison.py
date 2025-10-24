@@ -39,6 +39,13 @@ from tools.scheduler_nextgen import (
     EWMA,
 )
 from tools.run_with_events import enable_event_driven_simulation
+from tools.jct_slo import (
+    build_job_index,
+    compute_job_times,
+    summarize_jct,
+    build_job_types,
+    compute_slo_violations,
+)
 
 # 全局随机种子（影响数据加载等通用操作）
 np.random.seed(42)
@@ -440,6 +447,12 @@ def load_alibaba_trace(trace_dir: str, max_inst: int = None) -> List['Task']:
     print(f"  CPU: {df['cpu'].mean():.3f} (std={df['cpu'].std():.3f})")
     print(f"  MEM: {df['mem'].mean():.3f} (std={df['mem'].std():.3f})\n")
 
+    # 可选：时间压缩以提高并发度（论文常用做法）
+    # TIME_SPEEDUP>1 表示将到达与持续时间按该倍数加速（压缩时间轴）
+    time_speedup = float(os.getenv("TIME_SPEEDUP", "1.0"))
+    if time_speedup <= 0:
+        time_speedup = 1.0
+
     tasks = []
     for idx, row in df.sort_values(5).iterrows():
         slo_sensitive = 'high' if int(row['task_type']) == 1 else 'low'
@@ -456,13 +469,18 @@ def load_alibaba_trace(trace_dir: str, max_inst: int = None) -> List['Task']:
         start = int(row['start_time'])
         end = int(row['end_time'])
         duration = max(end - start, 0) if end > start else 0
+        if time_speedup > 1.0:
+            # 压缩时间轴：加速到达与运行时长
+            start = int(start / time_speedup)
+            end = int(end / time_speedup) if end > 0 else start
+            duration = max(1, int(duration / time_speedup)) if duration > 0 else 0
 
         task = Task(
             id=inst_id,
             cpu=cpu_req,
             mem=mem_req,
             tenant=str(row[2]),
-            arrival=int(row[5]),
+            arrival=int(start),
             slo_sensitive=slo_sensitive,
             priority=int(row['task_priority']),
             # 新增字段
@@ -484,7 +502,11 @@ def load_alibaba_trace(trace_dir: str, max_inst: int = None) -> List['Task']:
           f"中位数={np.median(durations):.0f}秒, "
           f"P90={np.percentile(durations, 90):.0f}秒")
     print(f"  到达时间跨度: {min(arrivals):.0f} ~ {max(arrivals):.0f} (共{max(arrivals) - min(arrivals):.0f}秒)")
-    print(f"  推荐调度间隔: {min(int(np.median(durations)), 60)}秒 (中位时长的一半或60秒)\n")
+    # 在日志中反映时间压缩后的推荐步长
+    rec_step_log = min(int(np.median(durations)), 60)
+    if time_speedup > 1.0:
+        rec_step_log = max(1, int(rec_step_log / time_speedup))
+    print(f"  推荐调度间隔: {rec_step_log}秒 (中位时长的一半或60秒)\n")
 
     return tasks
 
@@ -522,6 +544,10 @@ def run_firmament(tasks: List[Task], num_machines: int = 114) -> dict:
     durations = [t.duration for t in tasks if t.duration > 0]
     median_duration = int(np.median(durations)) if durations else 60
     recommended_step = max(1, min(median_duration // 2, 60))  # 中位时长的一半，最多60秒
+    # 若启用时间压缩，按同倍数压缩调度步长，维持相对粒度
+    time_speedup = float(os.getenv("TIME_SPEEDUP", "1.0"))
+    if time_speedup > 1.0:
+        recommended_step = max(1, int(recommended_step / time_speedup))
     batch_step = int(os.getenv("BATCH_STEP_SECONDS", str(recommended_step)))
 
     print(f"  [事件驱动] 调度间隔={batch_step}秒 (任务中位时长={median_duration}秒)")
@@ -535,6 +561,20 @@ def run_firmament(tasks: List[Task], num_machines: int = 114) -> dict:
     )
 
     result["name"] = "Firmament (OSDI'16 源码)"
+    # 计算 JCT 与 SLO（作业级）
+    try:
+        job_map, _ = build_job_index(tasks)
+        job_times = compute_job_times(result.get('timelines', {}), job_map, tasks)
+        result['jct_summary'] = summarize_jct(job_times)
+        job_types = build_job_types(tasks)
+        slo_thresholds = {
+            'high': float(os.getenv('SLO_JCT_HIGH', '600')),  # 10 分钟
+            'low': float(os.getenv('SLO_JCT_LOW', '900')),    # 15 分钟
+            'default': float(os.getenv('SLO_JCT_DEFAULT', '900')),
+        }
+        result['slo_violations'] = compute_slo_violations(job_times, job_types, slo_thresholds)
+    except Exception as _:
+        pass
     return result
 
 
@@ -584,6 +624,9 @@ def run_mesos_drf(tasks: List[Task], num_machines: int = 114) -> dict:
     durations = [t.duration for t in tasks if t.duration > 0]
     median_duration = int(np.median(durations)) if durations else 60
     recommended_step = max(1, min(median_duration // 2, 60))
+    time_speedup = float(os.getenv("TIME_SPEEDUP", "1.0"))
+    if time_speedup > 1.0:
+        recommended_step = max(1, int(recommended_step / time_speedup))
     batch_step = int(os.getenv("BATCH_STEP_SECONDS", str(recommended_step)))
 
     print(f"  [事件驱动] 调度间隔={batch_step}秒 (任务中位时长={median_duration}秒)")
@@ -597,6 +640,20 @@ def run_mesos_drf(tasks: List[Task], num_machines: int = 114) -> dict:
     )
 
     result["name"] = "Mesos DRF (NSDI'11 源码)"
+    # 计算 JCT 与 SLO（作业级）
+    try:
+        job_map, _ = build_job_index(tasks)
+        job_times = compute_job_times(result.get('timelines', {}), job_map, tasks)
+        result['jct_summary'] = summarize_jct(job_times)
+        job_types = build_job_types(tasks)
+        slo_thresholds = {
+            'high': float(os.getenv('SLO_JCT_HIGH', '600')),  # 10 分钟
+            'low': float(os.getenv('SLO_JCT_LOW', '900')),    # 15 分钟
+            'default': float(os.getenv('SLO_JCT_DEFAULT', '900')),
+        }
+        result['slo_violations'] = compute_slo_violations(job_times, job_types, slo_thresholds)
+    except Exception as _:
+        pass
     return result
 
 
@@ -663,6 +720,9 @@ def run_tetris(tasks: List[Task], num_machines: int = 114) -> dict:
     durations = [t.duration for t in tasks if t.duration > 0]
     median_duration = int(np.median(durations)) if durations else 60
     recommended_step = max(1, min(median_duration // 2, 60))
+    time_speedup = float(os.getenv("TIME_SPEEDUP", "1.0"))
+    if time_speedup > 1.0:
+        recommended_step = max(1, int(recommended_step / time_speedup))
     batch_step = int(os.getenv("BATCH_STEP_SECONDS", str(recommended_step)))
 
     print(f"  [事件驱动] 调度间隔={batch_step}秒 (任务中位时长={median_duration}秒)")
@@ -675,6 +735,20 @@ def run_tetris(tasks: List[Task], num_machines: int = 114) -> dict:
     )
 
     result["name"] = "Tetris (SIGCOMM'14 公式)"
+    # 计算 JCT 与 SLO（作业级）
+    try:
+        job_map, _ = build_job_index(tasks)
+        job_times = compute_job_times(result.get('timelines', {}), job_map, tasks)
+        result['jct_summary'] = summarize_jct(job_times)
+        job_types = build_job_types(tasks)
+        slo_thresholds = {
+            'high': float(os.getenv('SLO_JCT_HIGH', '600')),  # 10 分钟
+            'low': float(os.getenv('SLO_JCT_LOW', '900')),    # 15 分钟
+            'default': float(os.getenv('SLO_JCT_DEFAULT', '900')),
+        }
+        result['slo_violations'] = compute_slo_violations(job_times, job_types, slo_thresholds)
+    except Exception as _:
+        pass
     return result
 
 
@@ -1334,15 +1408,29 @@ def run_nextgen_scheduler(tasks: List[Task], num_machines: int = 114) -> dict:
     use_dynamic_release = os.getenv("NEXTGEN_DYNAMIC_RELEASE", "1") == "1"
     total_released = 0
 
-    # ⭐ 过程采样（与事件驱动模式保持一致）
+    # 事件驱动评估对齐：时间加权（AUC）+ 忙时窗口过滤 + 稳健CV
+    busy_util_min = float(os.getenv("BUSY_UTIL_MIN", "0.05"))
+    cv_min_mean_util = float(os.getenv("CV_MIN_MEAN_UTIL", "0.05"))
+
+    tw_total = 0.0
+    tw_util_sum = 0.0
+    tw_cpu_sum = 0.0
+    tw_mem_sum = 0.0
+    tw_real_cpu_sum = 0.0
+    tw_cv_sum = 0.0
+    max_util_seen = 0.0
+
+    # 仍保留稀疏采样以提供侧信息（非主统计口径）
     util_samples = []
     cpu_util_samples = []
     mem_util_samples = []
     real_cpu_samples = []
-    max_util_seen = 0.0
-    sample_interval = 100  # 每100个任务采样一次
+    sample_interval = 100  # 每100个任务采样一次（仅用于日志）
+
+    last_time = current_time
 
     while scheduled + failed < total_tasks:
+        prev_time = current_time
         # ⭐ 每次迭代开始时释放已完成任务的资源
         if use_dynamic_release:
             released_count = sum(m.release_completed_tasks(current_time) for m in machines)
@@ -1489,8 +1577,8 @@ def run_nextgen_scheduler(tasks: List[Task], num_machines: int = 114) -> dict:
                 attempts[tid] = attempt_count
                 retry_q.push(task_tuple, now_ms=current_time, attempts=attempt_count)
 
-        # Update global stats for next step
-        avg_util, max_util, std_util = cpu_mem_util(machines)
+        # Update global stats for next step（快照用于日志，不作为主统计口径）
+        avg_util, max_util_inst, std_util = cpu_mem_util(machines)
         frag = fragmentation(machines)
         imb = imbalance(machines)
         global_stats.update({
@@ -1498,6 +1586,44 @@ def run_nextgen_scheduler(tasks: List[Task], num_machines: int = 114) -> dict:
             "fragmentation": frag,
             "imbalance": imb,
         })
+
+        # ===== 时间加权积分（对齐 baselines 的事件驱动统计） =====
+        # 使用本轮结束时的占用状态作为 [prev_time, current_time) 的代表
+        delta_t = max(0, current_time - prev_time)
+        # 计算当前占用
+        current_utils = [m.utilization() for m in machines]
+        cpu_utils_now = [m.cpu_used / m.cpu if m.cpu > 0 else 0.0 for m in machines]
+        mem_utils_now = [m.mem_used / m.mem if m.mem > 0 else 0.0 for m in machines]
+        if current_utils:
+            avg_util_now = float(sum(current_utils) / len(current_utils))
+            cpu_util_now = float(sum(cpu_utils_now) / len(cpu_utils_now)) if cpu_utils_now else 0.0
+            mem_util_now = float(sum(mem_utils_now) / len(mem_utils_now)) if mem_utils_now else 0.0
+            # 稳健 CV（仅当平均≥阈值）
+            if avg_util_now >= cv_min_mean_util:
+                mean_u = avg_util_now
+                var_u = sum((u - mean_u) ** 2 for u in current_utils) / len(current_utils)
+                cv_now = (var_u ** 0.5) / mean_u if mean_u > 0 else 0.0
+            else:
+                cv_now = 0.0
+            # 真实CPU（仅动态释放模式下可得）
+            real_cpu_now = 0.0
+            if use_dynamic_release:
+                for m in machines:
+                    for tinfo in m.active_tasks:
+                        t_obj = next((t for t in sorted_tasks if t.id == tinfo['tid']), None)
+                        if t_obj:
+                            real_cpu_now += getattr(t_obj, 'real_cpu', tinfo['cpu'] * 0.5)
+
+            if delta_t > 0 and avg_util_now >= busy_util_min:
+                tw_total += delta_t
+                tw_util_sum += avg_util_now * delta_t
+                tw_cpu_sum += cpu_util_now * delta_t
+                tw_mem_sum += mem_util_now * delta_t
+                tw_real_cpu_sum += real_cpu_now * delta_t
+                tw_cv_sum += cv_now * delta_t
+
+            # 维护峰值
+            max_util_seen = max(max_util_seen, max(current_utils))
 
         # ⭐ 过程采样（每隔一定任务数采样一次）
         if (scheduled + failed) % sample_interval == 0:
@@ -1522,14 +1648,24 @@ def run_nextgen_scheduler(tasks: List[Task], num_machines: int = 114) -> dict:
                                 real_cpu_now += getattr(task_obj, 'real_cpu', task_info['cpu'] * 0.5)
                     real_cpu_samples.append(real_cpu_now)
 
-    # 计算过程平均指标（与事件驱动模式一致）
-    avg_util_over_time = sum(util_samples) / len(util_samples) if util_samples else 0.0
-    avg_cpu_util = sum(cpu_util_samples) / len(cpu_util_samples) if cpu_util_samples else 0.0
-    avg_mem_util = sum(mem_util_samples) / len(mem_util_samples) if mem_util_samples else 0.0
-
-    capacity_total = sum(m.cpu for m in machines)
-    avg_real_cpu = sum(real_cpu_samples) / len(real_cpu_samples) if real_cpu_samples else 0.0
-    effective_util_over_time = avg_real_cpu / capacity_total if capacity_total > 0 else 0.0
+    # 计算时间加权指标（与 baselines 对齐）；若无时间窗口则回退到算术平均
+    if tw_total > 0:
+        avg_util_over_time = tw_util_sum / tw_total
+        avg_cpu_util = tw_cpu_sum / tw_total
+        avg_mem_util = tw_mem_sum / tw_total
+        capacity_total = sum(m.cpu for m in machines)
+        avg_real_cpu = tw_real_cpu_sum / tw_total
+        effective_util_over_time = avg_real_cpu / capacity_total if capacity_total > 0 else 0.0
+        imbalance_over_time = tw_cv_sum / tw_total
+    else:
+        avg_util_over_time = sum(util_samples) / len(util_samples) if util_samples else 0.0
+        avg_cpu_util = sum(cpu_util_samples) / len(cpu_util_samples) if cpu_util_samples else 0.0
+        avg_mem_util = sum(mem_util_samples) / len(mem_util_samples) if mem_util_samples else 0.0
+        capacity_total = sum(m.cpu for m in machines)
+        avg_real_cpu = sum(real_cpu_samples) / len(real_cpu_samples) if real_cpu_samples else 0.0
+        effective_util_over_time = avg_real_cpu / capacity_total if capacity_total > 0 else 0.0
+        # 回退时无法稳健衡量CV，置0
+        imbalance_over_time = 0.0
 
     # 输出动态资源管理统计
     if use_dynamic_release:
@@ -1557,6 +1693,7 @@ def run_nextgen_scheduler(tasks: List[Task], num_machines: int = 114) -> dict:
         "avg_cpu_util": avg_cpu_util,
         "avg_mem_util": avg_mem_util,
         "effective_util_over_time": effective_util_over_time,
+        "imbalance_over_time": imbalance_over_time,
         "all_scheduled_task_ids": [t.id for t in sorted_tasks[:scheduled]],
     }
 
@@ -1589,17 +1726,17 @@ def analyze_result(result: dict, trace_dir: str, tasks: List[Task]) -> dict:
         effective_util = real_used / capacity_total if capacity_total else 0.0
         waste_rate = 1.0 - effective_util
 
-    # ⭐ 使用事件驱动模拟过程中的利用率（而不是最终快照）
+    # ⭐ 使用事件驱动模拟过程中的时间加权指标（而不是最终快照）
     if 'avg_util_over_time' in result and 'max_util_seen' in result:
-        # 事件驱动模式：使用过程中采样的利用率
+        # 事件驱动模式：使用时间加权平均
         avg_util = result['avg_util_over_time']
         max_util = result['max_util_seen']
         cpu_util = result.get('avg_cpu_util', 0.0)
         mem_util = result.get('avg_mem_util', 0.0)
         # 碎片率基于平均利用率
         frag = 1.0 - avg_util
-        # 失配率设为0（事件驱动下最终快照不准确，无法计算有意义的 std）
-        imb = 0.0
+        # 使用时间加权的不均衡CV
+        imb = result.get('imbalance_over_time', 0.0)
         std_util = 0.0
     else:
         # 静态模式：使用最终快照
@@ -1618,6 +1755,25 @@ def analyze_result(result: dict, trace_dir: str, tasks: List[Task]) -> dict:
     recv_bw, send_bw = net_bandwidth(trace_dir)
 
     total = result["scheduled"] + result["failed"]
+
+    # 可选：时间窗口内的成功率（按 submit/start 落在窗口内统计）
+    # 环境变量：WINDOW_START_SECONDS, WINDOW_HOURS
+    window_start_env = os.getenv("WINDOW_START_SECONDS")
+    window_hours_env = os.getenv("WINDOW_HOURS")
+    success_rate = None
+    if window_start_env and window_hours_env and isinstance(result, dict) and 'timelines' in result:
+        try:
+            w_start = int(float(window_start_env))
+            w_end = w_start + int(float(window_hours_env) * 3600)
+            # 窗口内到达的任务
+            arrived_in_window = {str(t.id) for t in tasks if w_start <= int(getattr(t, 'arrival', 0)) < w_end}
+            # 窗口内开始执行（被调度）的任务
+            timelines = result.get('timelines', {})
+            scheduled_in_window = {tid for tid, tl in timelines.items() if isinstance(tl, dict) and tl.get('start') is not None and w_start <= int(tl.get('start')) < w_end}
+            denom = max(len(arrived_in_window), 1)
+            success_rate = len(scheduled_in_window) / denom
+        except Exception:
+            success_rate = None
 
     # ----- DEBUG: per-algorithm request size and usage summary -----
     import numpy as np
@@ -1657,11 +1813,20 @@ def analyze_result(result: dict, trace_dir: str, tasks: List[Task]) -> dict:
                     affinity_hits += 1
     affinity_rate = affinity_hits / affinity_total if affinity_total else 0.0
 
+    # 为调试输出计算 Σreal_cpu：
+    # - 事件驱动：使用时间加权真实利用率 × 总容量
+    # - 静态模式：使用上面静态分支计算的 real_used
+    capacity_total_dbg = sum(m.cpu for m in machines)
+    if 'effective_util_over_time' in result:
+        real_used_dbg = effective_util * capacity_total_dbg
+    else:
+        real_used_dbg = real_used
+
     print(f"[DEBUG] {result['name']:<30}")
     print(
         f"        任务: 已调度={len(req_cpu):5d} | CPU: Σreq={sum(req_cpu):7.1f} avg={mean_cpu:.3f} P50={p50_cpu:.2f}")
     print(
-        f"                                | MEM: Σreq={sum(req_mem):7.1f} avg={mean_mem:.3f} | Σreal_cpu={real_used:.1f}")
+        f"                                | MEM: Σreq={sum(req_mem):7.1f} avg={mean_mem:.3f} | Σreal_cpu={real_used_dbg:.1f}")
     print(f"        节点: CPU主导={cpu_dominant:2d}台, MEM主导={mem_dominant:2d}台 / 共{len(machines)}台")
 
     # ⭐ 事件驱动模式的输出
@@ -1691,7 +1856,7 @@ def analyze_result(result: dict, trace_dir: str, tasks: List[Task]) -> dict:
         "machines": machines,
         "scheduled": result["scheduled"],
         "failed": result["failed"],
-        "success_rate": result["scheduled"] / max(total, 1),
+        "success_rate": success_rate if success_rate is not None else (result["scheduled"] / max(total, 1)),
         "avg_util": avg_util,
         "max_util": max_util,
         "std_util": std_util,
@@ -1778,6 +1943,21 @@ def main():
     res_nextgen = run_nextgen_scheduler(tasks, num_machines)
     print(
         f"  [DEBUG] NextGen返回: scheduled={res_nextgen.get('scheduled', 'N/A')}, failed={res_nextgen.get('failed', 'N/A')}")
+    # 计算 JCT 与 SLO（作业级）
+    try:
+        job_map, _ = build_job_index(tasks)
+        job_times = compute_job_times(res_nextgen.get('timelines', {}), job_map, tasks)
+        res_nextgen['jct_summary'] = summarize_jct(job_times)
+        job_types = build_job_types(tasks)
+        slo_thresholds = {
+            'high': float(os.getenv('SLO_JCT_HIGH', '600')),
+            'low': float(os.getenv('SLO_JCT_LOW', '900')),
+            'default': float(os.getenv('SLO_JCT_DEFAULT', '900')),
+        }
+        res_nextgen['slo_violations'] = compute_slo_violations(job_times, job_types, slo_thresholds)
+    except Exception as _:
+        pass
+
     results.append(analyze_result(res_nextgen, sys.argv[1], tasks))
 
     # 输出对比（修正对齐）
