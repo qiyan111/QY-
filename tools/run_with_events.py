@@ -71,12 +71,26 @@ def enable_event_driven_simulation(
     # 当前模拟时间（⭐ 从第一个任务到达时间开始）
     current_time = min(t.arrival for t in tasks) if tasks else 0
     num_scheduling_rounds = 0
-    max_scheduling_rounds = 10000
+    
+    # ⭐ 动态计算最大轮次：基于任务时间跨度和调度间隔
+    if tasks:
+        time_span = max(t.arrival for t in tasks) - min(t.arrival for t in tasks)
+        # 理论需要的轮次 = 时间跨度 / 调度间隔，再加 50% 缓冲
+        theoretical_rounds = int(time_span / batch_step_seconds * 1.5)
+        # 最少 10000，最多 1000000
+        max_scheduling_rounds = max(10000, min(theoretical_rounds, 1000000))
+    else:
+        max_scheduling_rounds = 10000
     
     print(f"  [模拟] 开始时间: {current_time}, 最大轮次: {max_scheduling_rounds}")
     
     # 待调度任务缓冲区
     pending_tasks = []
+    
+    # ⭐ 任务重试机制（对应真实系统的 resubmitTask）
+    enable_retry = os.getenv("ENABLE_TASK_RETRY", "1") == "1"
+    max_retries = int(os.getenv("MAX_TASK_RETRIES", "3"))
+    retry_counts = {}  # {task_id: retry_count}
     
     # ⭐ 追踪过程中的利用率（解决"最终快照"问题）
     util_samples = []  # 每个调度轮次的利用率快照
@@ -196,10 +210,32 @@ def enable_event_driven_simulation(
                         'framework_id': task.tenant if hasattr(task, 'tenant') else '',
                     })
             
-            # 记录调度失败的任务
+            # ⭐ 记录调度失败的任务，支持重试（对应 Firmament/Mesos 的重试机制）
+            failed_tasks_this_round = []
             for task in pending_tasks:
                 if task.id not in scheduled_ids:
-                    failed_count += 1
+                    if enable_retry:
+                        # 检查重试次数
+                        retry_count = retry_counts.get(task.id, 0)
+                        if retry_count < max_retries:
+                            # 重新加入待调度队列（延迟到下一个批次）
+                            retry_counts[task.id] = retry_count + 1
+                            failed_tasks_this_round.append(task)
+                        else:
+                            # 超过最大重试次数，标记为失败
+                            failed_count += 1
+                    else:
+                        # 不启用重试，直接失败
+                        failed_count += 1
+            
+            # ⭐ 将失败任务重新加入队列（下一个批次重试）
+            if enable_retry and failed_tasks_this_round:
+                # 添加重试事件（延迟到下一个调度批次）
+                retry_delay = batch_step_seconds
+                for task in failed_tasks_this_round:
+                    retry_time = current_time + retry_delay
+                    heapq.heappush(events, (retry_time, event_counter, 'TASK_SUBMIT', task))
+                    event_counter += 1
             
             pending_tasks = []
         
@@ -269,6 +305,10 @@ def enable_event_driven_simulation(
     print(f"\n  [事件驱动统计]")
     print(f"    调度轮次: {num_scheduling_rounds}")
     print(f"    已调度: {scheduled_count}, 失败: {failed_count}")
+    if enable_retry:
+        total_retries = sum(retry_counts.values())
+        tasks_with_retries = len(retry_counts)
+        print(f"    重试统计: {tasks_with_retries} 个任务重试, 总重试次数: {total_retries}")
     print(f"    采样次数: {len(util_samples)} (有任务运行时才采样)")
     print(f"    过程平均利用率(请求): {avg_util_over_time*100:.1f}%")
     print(f"    过程平均CPU利用率(请求): {avg_cpu_util*100:.1f}%")

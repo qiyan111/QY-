@@ -13,6 +13,19 @@ class Task:
     mem: float
     tenant: str
     arrival: int
+    slo_sensitive: str = 'low'
+    priority: int = 1
+    start_time: int = 0
+    end_time: int = 0
+    cpu_avg: float = 0.0
+    cpu_max: float = 0.0
+    machine_id: str = ""
+    duration: int = 60  # 默认60秒
+    real_cpu: float = 0.0
+    real_mem: float = 0.0
+    mem_bandwidth: float = 0.0
+    net_in: float = 0.0
+    net_out: float = 0.0
 
 def load_alibaba_trace_final(trace_dir: str, max_inst: int = 10000):
     """
@@ -53,16 +66,28 @@ def load_alibaba_trace_final(trace_dir: str, max_inst: int = 10000):
     print(f"  MEM 变异系数: {df['mem'].std()/df['mem'].mean():.2f}\n")
     
     # 转换为 Task 对象
-    tasks = [
-        Task(
+    tasks = []
+    for idx, row in df.sort_values(5).iterrows():
+        # 计算时长（如果有 start_time 和 end_time）
+        start_time = int(row[5]) if pd.notna(row[5]) else 0
+        end_time = int(row[6]) if pd.notna(row[6]) else start_time + 60
+        duration = max(10, end_time - start_time) if end_time > start_time else 60
+        
+        task = Task(
             id=idx,
             cpu=row['cpu'],
             mem=row['mem'],
             tenant=str(row[2]),
-            arrival=int(row[5])
+            arrival=start_time,
+            duration=duration,
+            start_time=start_time,
+            end_time=end_time,
+            cpu_avg=row['cpu'],
+            real_cpu=row['cpu'] * 0.5,  # 假设真实使用是请求的50%
+            real_mem=row['mem'] * 0.5,
+            machine_id=str(row[7]) if pd.notna(row[7]) else "",
         )
-        for idx, row in df.sort_values(5).iterrows()
-    ]
+        tasks.append(task)
     
     return tasks
 
